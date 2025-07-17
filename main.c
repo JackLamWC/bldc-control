@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include "chprintf.h"
+#include "as5600.h"
 
 #define MTR_PHASE_NUM 3
 #define MTR_PHASE_A 0
@@ -33,7 +34,7 @@
 #define LINE_DRV_M_OC               PAL_LINE(GPIOC, GPIOC_PIN12)
 #define LINE_DRV_OC_ADJ             PAL_LINE(GPIOD, GPIOD_PIN2)
 #define LINE_DRV_M_PWM              PAL_LINE(GPIOC, GPIOD_PIN9)
-#define LINE_DRV_DEBUG              PAL_LINE(GPIOC, GPIOC_PIN6)
+#define LINE_DRV_DEBUG              PAL_LINE(GPIOC, GPIOC_PIN5)
 
 
 #define MTR_COMM_SEQ_NUM 8
@@ -41,6 +42,145 @@
 static uint32_t last_isr_cycles = 0;
 static uint32_t debug_isr_duration_cycles = 0;
 static uint32_t end_cycles = 0;
+
+/*
+ * Encoder 
+ */
+
+#define LINE_MTR_ENC_I2C_SCL PAL_LINE(GPIOB, GPIOB_ARD_D10)
+#define LINE_MTR_ENC_I2C_SDA PAL_LINE(GPIOB, GPIOB_PIN7)
+#define LINE_MTR_ENC_I2C_ADDR 0x36
+#define MTR_ENC_I2C_DRIVER &I2CD1
+#define MTR_ENC_I2C_FREQ 400000
+#define MTR_ENC_I2C_TIMEOUT 10000
+
+// Encoder thread configuration
+#define MTR_ENC_THREAD_WA_SIZE THD_WORKING_AREA_SIZE(512)
+#define MTR_ENC_MEASUREMENT_FREQ 100  // 50Hz measurement frequency
+#define MTR_ENC_MEASUREMENT_INTERVAL_MS (1000 / MTR_ENC_MEASUREMENT_FREQ)  // 20ms
+
+/* Configure I2C for sensors */
+static const I2CConfig mtr_enc_i2c_config = {
+  OPMODE_I2C,
+  MTR_ENC_I2C_FREQ,
+  FAST_DUTY_CYCLE_2
+};
+
+static uint16_t mtr_enc_velocity = 0;
+static uint16_t mtr_enc_last_angle = 0;
+static bool mtr_enc_initialized = false;
+
+static uint16_t mtr_enc_get_velocity_ticks(void);
+static uint16_t mtr_enc_get_angle(void);
+
+// Thread-safe getter for encoder velocity
+static uint16_t mtr_enc_get_current_velocity(void) {
+  return mtr_enc_velocity;
+}
+
+// Convert encoder velocity ticks to degrees per second
+static float mtr_enc_get_velocity_deg_per_sec(void) {
+  // Encoder resolution: 4096 ticks per full rotation (360 degrees)
+  // Measurement frequency: 50Hz (20ms intervals)
+  // Formula: (velocity_ticks / 4096) * 360 * 50 = degrees per second
+  
+  float velocity_deg_per_sec = (float)mtr_enc_velocity * 360.0f / 4096.0f * MTR_ENC_MEASUREMENT_FREQ;
+  return velocity_deg_per_sec;
+}
+
+// Convert encoder velocity ticks to RPM (Revolutions Per Minute)
+static float mtr_enc_get_velocity_rpm(void) {
+  // Encoder resolution: 4096 ticks per full rotation
+  // Measurement frequency: 50Hz (20ms intervals)
+  // Formula: (velocity_ticks / 4096) * 60 * 50 = RPM
+  
+  float velocity_rpm = (float)mtr_enc_velocity * 60.0f / 4096.0f * MTR_ENC_MEASUREMENT_FREQ;
+  return velocity_rpm;
+}
+
+// Encoder measurement thread
+static THD_WORKING_AREA(mtr_enc_thread_wa, MTR_ENC_THREAD_WA_SIZE);
+static THD_FUNCTION(mtr_enc_thread, arg) {
+  (void)arg;
+  
+  while (true) {
+    if (mtr_enc_initialized) {
+      mtr_enc_velocity = mtr_enc_get_velocity_ticks();
+    }
+    chThdSleepMilliseconds(MTR_ENC_MEASUREMENT_INTERVAL_MS);
+  }
+}
+
+static uint32_t mtr_enc_i2c_transfer(uint8_t const slave_addr,
+                                     uint8_t const * const p_tx_buffer,
+                                     size_t const tx_buffer_size,
+                                     uint8_t * const p_rx_buffer,
+                                     size_t const rx_buffer_size) {
+  msg_t status;
+  
+  if (tx_buffer_size > 0) {
+    // Write operation
+    status = i2cMasterTransmitTimeout(MTR_ENC_I2C_DRIVER, slave_addr, 
+                                     p_tx_buffer, tx_buffer_size, 
+                                     p_rx_buffer, rx_buffer_size, 
+                                     MTR_ENC_I2C_TIMEOUT);
+  } else {
+    // Read operation
+    status = i2cMasterReceiveTimeout(MTR_ENC_I2C_DRIVER, slave_addr, 
+                                    p_rx_buffer, rx_buffer_size, 
+                                    MTR_ENC_I2C_TIMEOUT);
+  }
+  
+  return (status == MSG_OK) ? 0 : 1; // Return 0 for success, 1 for error
+}
+
+uint16_t mtr_enc_get_angle(void) {
+  uint16_t angle = 0;
+  as5600_error_t err = as5600_get_angle(&angle);
+  if(err != AS5600_ERROR_SUCCESS) {
+    LOG("mtr-enc-get-angle-err: %d\r\n", err);
+  }
+  return angle;
+}
+
+uint16_t mtr_enc_get_velocity_ticks(void) {
+  uint16_t angle = mtr_enc_get_angle();
+  uint16_t velocity;
+  
+  // Handle angle wrapping from 4095 back to 0
+  if (angle >= mtr_enc_last_angle) {
+    velocity = angle - mtr_enc_last_angle;
+  } else {
+    // Angle wrapped around from 4095 to 0
+    velocity = (4095 - mtr_enc_last_angle + 1) + angle;
+  }
+  
+  mtr_enc_last_angle = angle;
+  return velocity;  // Return actual velocity instead of 0
+}
+
+void mtr_enc_init(void) {
+  palSetLineMode(LINE_MTR_ENC_I2C_SCL, PAL_MODE_ALTERNATE(4));
+  palSetLineMode(LINE_MTR_ENC_I2C_SDA, PAL_MODE_ALTERNATE(4));
+  i2cStart(MTR_ENC_I2C_DRIVER, &mtr_enc_i2c_config);
+  as5600_error_t err = as5600_init(mtr_enc_i2c_transfer);
+  LOG("mtr-enc-init-err: %d\r\n", err);
+  chThdSleepMilliseconds(300);
+  
+  // Start encoder measurement thread
+  thread_t *enc_thread = chThdCreateStatic(mtr_enc_thread_wa, 
+                                          sizeof(mtr_enc_thread_wa), 
+                                          NORMALPRIO + 2, 
+                                          mtr_enc_thread, 
+                                          NULL);
+  if (enc_thread != NULL) {
+    mtr_enc_initialized = true;
+    LOG("mtr-enc-thread-started\r\n");
+  } else {
+    LOG("mtr-enc-thread-start-failed\r\n");
+  }
+}
+
 
 
 /*
@@ -145,7 +285,7 @@ static uint32_t end_cycles = 0;
 #define MTR_VELOCITY_TIMER_FREQ 1000000
 
 static uint16_t mtr_velocity_last_ticks_us = 0;
-static uint16_t mtr_velocity_interval_us = 0;
+static uint16_t mtr_current_velocity_interval_us = 0;
 
 static GPTConfig mtr_velocity_timer_config = {
   .frequency = MTR_VELOCITY_TIMER_FREQ,
@@ -171,8 +311,12 @@ static void mtr_velocity_init(void) {
 // Assume the update event will not shorter than 1us
 static uint16_t mtr_velocity_get_interval_us(void) {
   uint16_t current_ticks = gptGetCounterX(MTR_VELOCITY_TIMER);
-  mtr_velocity_interval_us = mtr_velocity_calculate_timer_interval(current_ticks, mtr_velocity_last_ticks_us, MTR_VELOCITY_TIMER_MAX_VALUE);
-  return mtr_velocity_interval_us;
+  mtr_current_velocity_interval_us = mtr_velocity_calculate_timer_interval(current_ticks, mtr_velocity_last_ticks_us, MTR_VELOCITY_TIMER_MAX_VALUE);
+  return mtr_current_velocity_interval_us;
+}
+
+static uint16_t mtr_velocity_get_current_interval_us(void) {
+  return mtr_current_velocity_interval_us;
 }
 
 static void mtr_velocity_update(uint16_t current_ticks) {
@@ -363,7 +507,7 @@ static float mtr_back_emf_get_voltage(uint8_t channel) {
 /*===========================================================================*/
 /* Back-EMF voltage averaging for noise reduction                             */
 /*===========================================================================*/
-#define MTR_BACK_EMF_AVERAGE_BUFFER_SIZE 4  // Number of samples to average per channel
+#define MTR_BACK_EMF_AVERAGE_BUFFER_SIZE 2  // Number of samples to average per channel
 static float mtr_back_emf_average_buffer[MTR_BACK_EMF_ADC_NUM_CHANNELS][MTR_BACK_EMF_AVERAGE_BUFFER_SIZE];
 static uint8_t mtr_back_emf_average_buffer_index = 0;
 static uint8_t mtr_back_emf_average_buffer_count = 0;
@@ -425,7 +569,7 @@ static void mtr_back_emf_average_reset(void) {
 /* Commutation Zero Crossing Detection */
 #define MTR_COMM_ZERO_CROSSING_DETECTION_THRESHOLD 0.5
 #define MTR_COMM_ZERO_CROSSING_DELAY_TIMER &GPTD11
-#define MTR_COMM_ZERO_LOWEST_INTERVAL_US 1000
+#define MTR_COMM_ZERO_LOWEST_INTERVAL_US 400
 
 static bool mtr_commutation_crossed_zero = false;
 
@@ -588,10 +732,12 @@ static void cmd_mtr_debug(BaseSequentialStream *chp, int argc, char *argv[]) {
   (void)chp;
   (void)argc;
   (void)argv;
-  LOG("mtr-debug: %d\r\n", debug_cnt);
-  LOG("mtr-commutation-cross-zero: %d\r\n", mtr_commutation_crossed_zero);
-  LOG("mtr_commutation_sequence_state: %d\r\n", mtr_commutation_sequence_state);
-  LOG("current valid state: %d\r\n", mtr_commutation_sequence_is_valid_state(mtr_commutation_sequence_state));
+  LOG("current velocity interval: %d us\r\n", mtr_velocity_get_current_interval_us());
+  LOG("current velocity interval average: %d us\r\n", mtr_velocity_interval_average_get());
+  LOG("commutation frequency to motor rpm: %.2f\r\n", 10000000.0f / (mtr_velocity_interval_average_get() * 7));
+  LOG("mtr-enc-angle: %.2f\r\n", (mtr_enc_get_angle() / 4096.0 * 360));
+  LOG("mtr-enc-velocity-deg/s: %.2f\r\n", mtr_enc_get_velocity_deg_per_sec());
+  LOG("mtr-enc-velocity-rpm: %.2f\r\n", mtr_enc_get_velocity_rpm());
 }
 
 /*===========================================================================*/
@@ -656,8 +802,7 @@ int main(void) {
   mtr_back_emf_init();
   mtr_velocity_init();
   mtr_commutation_zero_crossing_init();
-  
-  // Initialize averaging buffers
+  mtr_enc_init();
   mtr_back_emf_average_reset();
   mtr_velocity_interval_average_reset();
 
