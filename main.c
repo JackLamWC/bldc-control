@@ -27,6 +27,12 @@
 #define MTR_PHASE_A 0
 #define MTR_PHASE_B 1
 #define MTR_PHASE_C 2
+#define MTR_POLE_PAIR_NUM 7
+
+#define USE_ENCODER
+
+// Macro to calculate RPM from commutation interval in microseconds
+#define MTR_CALCULATE_RPM(commutation_interval_us) (10000000.0f / ((commutation_interval_us) * MTR_POLE_PAIR_NUM))
 
 #define LINE_DRV_ENABLE             PAL_LINE(GPIOC, GPIOC_PIN8)
 #define LINE_DRV_N_FAULT            PAL_LINE(GPIOC, GPIOC_PIN10) 
@@ -39,10 +45,12 @@
 
 #define MTR_COMM_SEQ_NUM 8
 
+
 static uint32_t last_isr_cycles = 0;
 static uint32_t debug_isr_duration_cycles = 0;
 static uint32_t end_cycles = 0;
 
+#ifdef USE_ENCODER
 /*
  * Encoder 
  */
@@ -54,9 +62,10 @@ static uint32_t end_cycles = 0;
 #define MTR_ENC_I2C_FREQ 400000
 #define MTR_ENC_I2C_TIMEOUT 10000
 
+
 // Encoder thread configuration
 #define MTR_ENC_THREAD_WA_SIZE THD_WORKING_AREA_SIZE(512)
-#define MTR_ENC_MEASUREMENT_FREQ 100  // 50Hz measurement frequency
+#define MTR_ENC_MEASUREMENT_FREQ 50  // 50Hz measurement frequency
 #define MTR_ENC_MEASUREMENT_INTERVAL_MS (1000 / MTR_ENC_MEASUREMENT_FREQ)  // 20ms
 
 /* Configure I2C for sensors */
@@ -181,7 +190,7 @@ void mtr_enc_init(void) {
   }
 }
 
-
+#endif
 
 /*
  * Phase PWM output
@@ -507,7 +516,7 @@ static float mtr_back_emf_get_voltage(uint8_t channel) {
 /*===========================================================================*/
 /* Back-EMF voltage averaging for noise reduction                             */
 /*===========================================================================*/
-#define MTR_BACK_EMF_AVERAGE_BUFFER_SIZE 2  // Number of samples to average per channel
+#define MTR_BACK_EMF_AVERAGE_BUFFER_SIZE 4  // Number of samples to average per channel
 static float mtr_back_emf_average_buffer[MTR_BACK_EMF_ADC_NUM_CHANNELS][MTR_BACK_EMF_AVERAGE_BUFFER_SIZE];
 static uint8_t mtr_back_emf_average_buffer_index = 0;
 static uint8_t mtr_back_emf_average_buffer_count = 0;
@@ -734,10 +743,12 @@ static void cmd_mtr_debug(BaseSequentialStream *chp, int argc, char *argv[]) {
   (void)argv;
   LOG("current velocity interval: %d us\r\n", mtr_velocity_get_current_interval_us());
   LOG("current velocity interval average: %d us\r\n", mtr_velocity_interval_average_get());
-  LOG("commutation frequency to motor rpm: %.2f\r\n", 10000000.0f / (mtr_velocity_interval_average_get() * 7));
+  LOG("commutation frequency to motor rpm: %.2f\r\n", MTR_CALCULATE_RPM(mtr_velocity_interval_average_get()));
+#ifdef USE_ENCODER
   LOG("mtr-enc-angle: %.2f\r\n", (mtr_enc_get_angle() / 4096.0 * 360));
   LOG("mtr-enc-velocity-deg/s: %.2f\r\n", mtr_enc_get_velocity_deg_per_sec());
   LOG("mtr-enc-velocity-rpm: %.2f\r\n", mtr_enc_get_velocity_rpm());
+#endif
 }
 
 /*===========================================================================*/
@@ -802,9 +813,11 @@ int main(void) {
   mtr_back_emf_init();
   mtr_velocity_init();
   mtr_commutation_zero_crossing_init();
+#ifdef USE_ENCODER
   mtr_enc_init();
   mtr_back_emf_average_reset();
   mtr_velocity_interval_average_reset();
+#endif
 
   while (true) {
     thread_t *shell_thd = chThdCreateFromHeap(NULL, SHELL_WA_SIZE, "shell", NORMALPRIO + 1, shellThread, (void *)&shell_cfg);
