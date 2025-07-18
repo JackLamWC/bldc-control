@@ -27,9 +27,9 @@
 #define MTR_PHASE_A 0
 #define MTR_PHASE_B 1
 #define MTR_PHASE_C 2
-#define MTR_POLE_PAIR_NUM 7
+#define MTR_POLE_PAIR_NUM 3
 
-#define USE_ENCODER
+// #define USE_ENCODER
 
 // Macro to calculate RPM from commutation interval in microseconds
 #define MTR_CALCULATE_RPM(commutation_interval_us) (10000000.0f / ((commutation_interval_us) * MTR_POLE_PAIR_NUM))
@@ -224,7 +224,23 @@ void mtr_enc_init(void) {
  #define MTR_PWM_CLOCK_FREQ 42000000
  #define MTR_PWM_FREQ 100000 
 
+ typedef enum {
+  MTR_DIRECTION_FORWARD,
+  MTR_DIRECTION_REVERSE,
+ } mtr_direction_e;
+
+ static mtr_direction_e mtr_direction = MTR_DIRECTION_FORWARD;
+
+ static void mtr_set_direction(mtr_direction_e direction) {
+  mtr_direction = direction;
+ }
+
+ static mtr_direction_e mtr_get_direction(void) {
+  return mtr_direction;
+ }
+
  static volatile uint16_t mtr_pwm_current_duty = 0;
+ 
 
  static uint16_t mtr_get_duty(void) {
   return mtr_pwm_current_duty;
@@ -436,11 +452,21 @@ static uint16_t debug_cnt = 0;
 static void mtr_commutation_zero_crossing_set_crossed_zero(bool crossed_zero);
 static void mtr_commutation_sequence_transition_state(void) {
   mtr_commutation_sequence_index_t next_state = mtr_commutation_sequence_state + 1;
-  if(mtr_commutation_sequence_state == MTR_COMM_SEQ_IDX_101) {
-    next_state = MTR_COMM_SEQ_IDX_100;
+  if(mtr_get_direction() == MTR_DIRECTION_FORWARD) {
+    if(mtr_commutation_sequence_state == MTR_COMM_SEQ_IDX_101) {
+      next_state = MTR_COMM_SEQ_IDX_100;
+    }
+    else {
+      next_state = mtr_commutation_sequence_state + 1;
+    }
   }
   else {
-    next_state = mtr_commutation_sequence_state + 1;
+    if(mtr_commutation_sequence_state == MTR_COMM_SEQ_IDX_100) {
+      next_state = MTR_COMM_SEQ_IDX_101;
+    }
+    else {
+      next_state = mtr_commutation_sequence_state - 1;
+    }
   }
   mtr_commutation_sequence_set_state(next_state);
   mtr_commutation_zero_crossing_set_crossed_zero(false);
@@ -626,6 +652,9 @@ static bool mtr_commutation_zero_crossing_is_valid(void) {
   float float_phase_voltage = mtr_back_emf_average_get(float_phase);
   float vpdd_voltage = mtr_back_emf_average_get(MTR_BACK_EMF_ADC_VPDD_INDEX);
   mtr_commutation_sequence_detect_edge_t detect_edge = mtr_commutation_sequence_config[mtr_commutation_sequence_state].detect_edge;
+  if(mtr_get_direction() == MTR_DIRECTION_REVERSE) {
+    detect_edge = (detect_edge == MTR_COMM_SEQ_DETECT_EDGE_RISING) ? MTR_COMM_SEQ_DETECT_EDGE_FALLING : MTR_COMM_SEQ_DETECT_EDGE_RISING;
+  }
   if(detect_edge == MTR_COMM_SEQ_DETECT_EDGE_RISING) {
     return float_phase_voltage >= vpdd_voltage * MTR_COMM_ZERO_CROSSING_DETECTION_THRESHOLD;
   } else {
@@ -719,20 +748,26 @@ static void cmd_run(BaseSequentialStream *chp, int argc, char *argv[]) {
   (void)argc;
   (void)argv;
   if(argc == 1) {
-    uint16_t input_duty = atoi(argv[0]) * 100;
+    int32_t input_duty = atoi(argv[0]) * 100;
     LOG("mtr-run: %d\r\n", input_duty);
     if(input_duty != 0) {
+      if(input_duty > 0) {
+        mtr_set_direction(MTR_DIRECTION_FORWARD);
+      } else {
+        mtr_set_direction(MTR_DIRECTION_REVERSE);
+      }
       if(mtr_get_duty() == 0) {
-        mtr_set_duty(input_duty);
+        mtr_set_duty(abs(input_duty));
         mtr_commutation_sequence_set_state(MTR_COMM_SEQ_IDX_100);
         mtr_back_emf_average_reset();
         mtr_velocity_interval_average_reset();
       } else {
-        mtr_set_duty(input_duty);
+        mtr_set_duty(abs(input_duty));
       }
     }
     else {
       mtr_set_duty(0); 
+      chThdSleepMilliseconds(100);
       mtr_commutation_sequence_set_state(MTR_COMM_SEQ_IDX_000);
     }
   }
