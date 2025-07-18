@@ -761,7 +761,6 @@ static void cmd_mtr_debug(BaseSequentialStream *chp, int argc, char *argv[]) {
   LOG("mtr-enc-angle: %.2f\r\n", (mtr_enc_get_angle() / 4096.0 * 360));
   LOG("mtr-enc-velocity-deg/s: %.2f\r\n", mtr_enc_get_velocity_deg_per_sec());
   LOG("mtr-enc-velocity-rpm (mechanical): %.2f\r\n", mtr_enc_get_velocity_rpm());
-  LOG("mtr-enc-velocity-rpm (electrical): %.2f\r\n", mtr_enc_get_electrical_rpm());
 #endif
 }
 
