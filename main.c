@@ -65,7 +65,7 @@ static uint32_t end_cycles = 0;
 
 // Encoder thread configuration
 #define MTR_ENC_THREAD_WA_SIZE THD_WORKING_AREA_SIZE(512)
-#define MTR_ENC_MEASUREMENT_FREQ 50  // 50Hz measurement frequency
+#define MTR_ENC_MEASUREMENT_FREQ 200  // 50Hz measurement frequency
 #define MTR_ENC_MEASUREMENT_INTERVAL_MS (1000 / MTR_ENC_MEASUREMENT_FREQ)  // 20ms
 
 /* Configure I2C for sensors */
@@ -93,7 +93,8 @@ static float mtr_enc_get_velocity_deg_per_sec(void) {
   // Measurement frequency: 50Hz (20ms intervals)
   // Formula: (velocity_ticks / 4096) * 360 * 50 = degrees per second
   
-  float velocity_deg_per_sec = (float)mtr_enc_velocity * 360.0f / 4096.0f * MTR_ENC_MEASUREMENT_FREQ;
+  int16_t velocity_ticks = (int16_t)mtr_enc_velocity;  // Convert back to signed
+  float velocity_deg_per_sec = (float)velocity_ticks * 360.0f / 4096.0f * MTR_ENC_MEASUREMENT_FREQ;
   return velocity_deg_per_sec;
 }
 
@@ -103,8 +104,15 @@ static float mtr_enc_get_velocity_rpm(void) {
   // Measurement frequency: 50Hz (20ms intervals)
   // Formula: (velocity_ticks / 4096) * 60 * 50 = RPM
   
-  float velocity_rpm = (float)mtr_enc_velocity * 60.0f / 4096.0f * MTR_ENC_MEASUREMENT_FREQ;
+  int16_t velocity_ticks = (int16_t)mtr_enc_velocity;  // Convert back to signed
+  float velocity_rpm = (float)velocity_ticks * 60.0f / 4096.0f * MTR_ENC_MEASUREMENT_FREQ;
   return velocity_rpm;
+}
+
+// Convert encoder mechanical RPM to electrical RPM (for comparison with back-EMF)
+static float mtr_enc_get_electrical_rpm(void) {
+  float mechanical_rpm = mtr_enc_get_velocity_rpm();
+  return mechanical_rpm * MTR_POLE_PAIR_NUM;  // Convert to electrical RPM
 }
 
 // Encoder measurement thread
@@ -154,7 +162,7 @@ uint16_t mtr_enc_get_angle(void) {
 
 uint16_t mtr_enc_get_velocity_ticks(void) {
   uint16_t angle = mtr_enc_get_angle();
-  uint16_t velocity;
+  int16_t velocity;  // Changed to int16_t to handle negative velocities
   
   // Handle angle wrapping from 4095 back to 0
   if (angle >= mtr_enc_last_angle) {
@@ -164,8 +172,13 @@ uint16_t mtr_enc_get_velocity_ticks(void) {
     velocity = (4095 - mtr_enc_last_angle + 1) + angle;
   }
   
+  // Handle potential reverse direction (if velocity is too large, it might be negative)
+  if (velocity > 2048) {
+    velocity = velocity - 4096;  // Convert to negative
+  }
+  
   mtr_enc_last_angle = angle;
-  return velocity;  // Return actual velocity instead of 0
+  return (uint16_t)velocity;  // Return as unsigned for compatibility
 }
 
 void mtr_enc_init(void) {
@@ -747,7 +760,8 @@ static void cmd_mtr_debug(BaseSequentialStream *chp, int argc, char *argv[]) {
 #ifdef USE_ENCODER
   LOG("mtr-enc-angle: %.2f\r\n", (mtr_enc_get_angle() / 4096.0 * 360));
   LOG("mtr-enc-velocity-deg/s: %.2f\r\n", mtr_enc_get_velocity_deg_per_sec());
-  LOG("mtr-enc-velocity-rpm: %.2f\r\n", mtr_enc_get_velocity_rpm());
+  LOG("mtr-enc-velocity-rpm (mechanical): %.2f\r\n", mtr_enc_get_velocity_rpm());
+  LOG("mtr-enc-velocity-rpm (electrical): %.2f\r\n", mtr_enc_get_electrical_rpm());
 #endif
 }
 
