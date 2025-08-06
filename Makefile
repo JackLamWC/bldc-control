@@ -119,6 +119,7 @@ LDSCRIPT= $(STARTUPLD)/STM32F401xE.ld
 # setting.
 CSRC = $(ALLCSRC) \
        src/as5600/as5600.c \
+       src/foc/foc.c \
        main.c  \
 
 # C++ sources that can be compiled in ARM or THUMB mode depending on the global
@@ -156,7 +157,7 @@ UDEFS = -DSHELL_CMD_TEST_ENABLED=0 -DSHELL_USE_HISTORY=1 -DSHELL_USE_COMPLETION=
 UADEFS =
 
 # List all user directories here
-UINCDIR = src/as5600/
+UINCDIR = src/as5600/ src/foc/
 
 # List the user directory to look for the libraries here
 ULIBDIR =
