@@ -14,6 +14,7 @@
 #define LINE_DRV_OC_ADJ             PAL_LINE(GPIOD, GPIOD_PIN2)
 #define LINE_DRV_M_PWM              PAL_LINE(GPIOC, GPIOD_PIN9)
 #define LINE_DRV_DEBUG              PAL_LINE(GPIOC, GPIOC_PIN5)
+#define LINE_DRV_DEBUG2             PAL_LINE(GPIOC, GPIOC_PIN6)
 
 
 /*===========================================================================*/
@@ -129,33 +130,33 @@ static void pwm_set_duty_cycle(uint8_t channel, uint16_t duty_cycle) {
 }
 
 static void pwm_slave_init(void) {
-  // Enable TIM2 clock
-  RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
+  // Enable TIM4 clock
+  RCC->APB1ENR |= RCC_APB1ENR_TIM4EN;
 
-  // Configure TIM2 to use external clock mode
-  TIM2->PSC = 0;                    
-  TIM2->ARR = 1;                    // Count to 2 (0,1) then reset
+  // Configure TIM4 to use external clock mode
+  TIM4->PSC = 0;                    
+  TIM4->ARR = 1;                    // Count to 2 (0,1) then reset
 
-  // Configure TIM2 as external clock mode
-  TIM2->SMCR &= ~TIM_SMCR_SMS_Msk;
-  TIM2->SMCR |= TIM_SMCR_SMS_2 | TIM_SMCR_SMS_1 | TIM_SMCR_SMS_0;  // External clock (111)
+  // Configure TIM4 as external clock mode
+  TIM4->SMCR &= ~TIM_SMCR_SMS_Msk;
+  TIM4->SMCR |= TIM_SMCR_SMS_2 | TIM_SMCR_SMS_1 | TIM_SMCR_SMS_0;  // External clock (111)
 
   // Select TIM1 as trigger source
-  TIM2->SMCR &= ~TIM_SMCR_TS_Msk;
+  TIM4->SMCR &= ~TIM_SMCR_TS_Msk;
 
   // Enable the update event for ADC triggering
-  TIM2->CR2 &= ~TIM_CR2_MMS_Msk;
-  TIM2->CR2 |= TIM_CR2_MMS_1;      // Update event as TRGO
+  TIM4->CR2 &= ~TIM_CR2_MMS_Msk;
+  TIM4->CR2 |= TIM_CR2_MMS_1;      // Update event as TRGO
 
-  // Enable TIM2 update interrupt
-  TIM2->DIER |= TIM_DIER_UIE;      // Enable Update Interrupt Enable
+  // Enable TIM4 update interrupt
+  TIM4->DIER |= TIM_DIER_UIE;      // Enable Update Interrupt Enable
   
-  // Enable TIM2 counter
-  TIM2->CR1 |= TIM_CR1_CEN;
+  // Enable TIM4 counter
+  TIM4->CR1 |= TIM_CR1_CEN;
   
-  // Configure TIM2 interrupt in NVIC
-  NVIC_EnableIRQ(TIM2_IRQn);
-  NVIC_SetPriority(TIM2_IRQn, 3);  // Lower priority than ADC
+  // Configure TIM4 interrupt in NVIC
+  NVIC_EnableIRQ(TIM4_IRQn);
+  NVIC_SetPriority(TIM4_IRQn, 3);  // Lower priority than ADC
 
   // Enable the main output
   TIM1->BDTR |= TIM_BDTR_MOE;
@@ -220,13 +221,11 @@ CH_IRQ_HANDLER(STM32_ADC_HANDLER) {
   }
 }
 
-// TIM2 Update Interrupt Handler
-CH_FAST_IRQ_HANDLER(STM32_TIM2_HANDLER) {
-  if (TIM2->SR & TIM_SR_UIF) {       
-    TIM2->SR &= ~TIM_SR_UIF;         
-    if(TIM2->CNT == 1) {
-      palSetLine(LINE_DRV_DEBUG);
-    }
+// TIM4 Update Interrupt Handler
+CH_FAST_IRQ_HANDLER(STM32_TIM4_HANDLER) {
+  if (TIM4->SR & TIM_SR_UIF) {       
+    TIM4->SR &= ~TIM_SR_UIF;
+    palSetLine(LINE_DRV_DEBUG);
   }
 }
 
@@ -248,9 +247,9 @@ static void adc_init(void) {
   ADC1->CR1 |= ADC_CR1_JEOCIE;
 
 
-  // Select TIM2 (PWM Slave) as trigger source on rising edge
+  // Select TIM4 (PWM Slave) as trigger source on rising edge
   ADC1->CR2 &= ~(ADC_CR2_JEXTSEL_Msk | ADC_CR2_JEXTEN_Msk);
-  ADC1->CR2 |= ADC_CR2_JEXTSEL_1 | ADC_CR2_JEXTSEL_0;
+  ADC1->CR2 |= ADC_CR2_JEXTSEL_3 | ADC_CR2_JEXTSEL_0;
   ADC1->CR2 |= ADC_CR2_JEXTEN_0;
 
   // Enable ADC Conversion
@@ -375,17 +374,17 @@ static void cmd_check_pwm_trigger(BaseSequentialStream *chp, int argc, char *arg
   
   chprintf(chp, "PWM/Timer Status:\n");
   chprintf(chp, "TIM1->CR1 = 0x%08lx (should have CEN=1)\n", TIM1->CR1);
-  chprintf(chp, "TIM2->CR1 = 0x%08lx (should have CEN=1)\n", TIM2->CR1);
+  chprintf(chp, "TIM4->CR1 = 0x%08lx (should have CEN=1)\n", TIM4->CR1);
   chprintf(chp, "TIM1->CNT = %lu\n", TIM1->CNT);
-  chprintf(chp, "TIM2->CNT = %lu (should be counting)\n", TIM2->CNT);
+  chprintf(chp, "TIM4->CNT = %lu (should be counting)\n", TIM4->CNT);
   
   chThdSleepMilliseconds(100);
-  chprintf(chp, "TIM2->CNT after 100ms = %lu (should be different)\n", TIM2->CNT);
+  chprintf(chp, "TIM4->CNT after 100ms = %lu (should be different)\n", TIM4->CNT);
   
   chprintf(chp, "\nADC Trigger Configuration:\n");
   chprintf(chp, "ADC1->CR2 = 0x%08lx\n", ADC1->CR2);
   // Temporarily commented out - might be causing hang
-  // chprintf(chp, "Expected JEXTSEL = 0x%lx (TIM2_TRGO)\n", (ADC1->CR2 & ADC_CR2_JEXTSEL_Msk) >> ADC_CR2_JEXTSEL_Pos);
+  // chprintf(chp, "Expected JEXTSEL = 0x%lx (TIM4_TRGO)\n", (ADC1->CR2 & ADC_CR2_JEXTSEL_Msk) >> ADC_CR2_JEXTSEL_Pos);
   // chprintf(chp, "Expected JEXTEN = 0x%lx (Rising edge)\n", (ADC1->CR2 & ADC_CR2_JEXTEN_Msk) >> ADC_CR2_JEXTEN_Pos);
 }
 
@@ -503,6 +502,7 @@ int main(void) {
   palSetLineMode(LINE_DRV_M_PWM, PAL_MODE_OUTPUT_PUSHPULL);
   palSetLineMode(LINE_DRV_DEBUG, PAL_MODE_OUTPUT_PUSHPULL);
   palClearLine(LINE_DRV_DEBUG);
+  palSetLineMode(LINE_DRV_DEBUG2, PAL_MODE_OUTPUT_PUSHPULL);
 
   while (true) {
     thread_t *shell_thd = chThdCreateFromHeap(NULL, SHELL_WA_SIZE, "shell", NORMALPRIO + 1, shellThread, (void *)&shell_cfg);
