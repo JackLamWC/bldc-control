@@ -8,8 +8,7 @@
 static pid_controller_t d_pid;
 static pid_controller_t q_pid;
 
-// Global function pointers for hardware abstraction
-foc_get_currents_func_t foc_get_currents = NULL;
+// Global function pointer for hardware abstraction
 foc_set_pwm_func_t foc_set_pwm = NULL;
 
 // PID Controller Functions
@@ -64,13 +63,15 @@ void pid_reset(pid_controller_t *pid) {
     pid->integral = 0.0f;
 }
 
-void foc_init(float dt, foc_get_currents_func_t get_currents_func, foc_set_pwm_func_t set_pwm_func) {
+void foc_init(uint16_t frequency_hz, foc_set_pwm_func_t set_pwm_func) {
+    // Calculate dt from frequency
+    float dt = 1.0f / (float)frequency_hz;
+    
     // Initialize PID controllers
     pid_init(&d_pid, 1.0f, 10.0f, 0.0f, dt, -FOC_BATTERY_VOLTAGE, FOC_BATTERY_VOLTAGE);
     pid_init(&q_pid, 1.0f, 10.0f, 0.0f, dt, -FOC_BATTERY_VOLTAGE, FOC_BATTERY_VOLTAGE);
     
-    // Set hardware function pointers
-    foc_get_currents = get_currents_func;
+    // Set hardware function pointer
     foc_set_pwm = set_pwm_func;
 }
 
@@ -137,8 +138,7 @@ void foc_svpwm_modulation(float va, float vb, float vc, float *duty_a, float *du
 }
 
 // q_ref should be normalized to -1 to 1
-void foc_update(float theta, float q_ref) {
-    uint16_t ia, ib, ic;
+void foc_update(float theta, float q_ref, float ia_volts, float ib_volts, float ic_volts) {
     float alpha, beta;
     float v_alpha, v_beta;
     float d, q;
@@ -148,18 +148,15 @@ void foc_update(float theta, float q_ref) {
     // For d-axis reference (usually 0 for surface mounted PMSM)
     float d_ref = 0.0f;
 
-    // Check if function pointers are set
-    if (foc_get_currents == NULL || foc_set_pwm == NULL) {
-        return; // Hardware functions not initialized
+    // Check if function pointer is set
+    if (foc_set_pwm == NULL) {
+        return; // Hardware function not initialized
     }
 
-    // Get current readings from hardware
-    foc_get_currents(&ia, &ib, &ic);
-
-    // Convert ADC readings to actual current values
-    float ia_f = FOC_CURRENT_GET_CURRENT_F(ia);
-    float ib_f = FOC_CURRENT_GET_CURRENT_F(ib);
-    float ic_f = FOC_CURRENT_GET_CURRENT_F(ic);
+    // Convert voltage readings to actual current values
+    float ia_f = FOC_CURRENT_GET_CURRENT_F(ia_volts);
+    float ib_f = FOC_CURRENT_GET_CURRENT_F(ib_volts);
+    float ic_f = FOC_CURRENT_GET_CURRENT_F(ic_volts);
 
     // Clarke transform to get alpha and beta
     foc_clarke_transform(ia_f, ib_f, ic_f, &alpha, &beta);

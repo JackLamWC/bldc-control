@@ -66,7 +66,7 @@ endif
 
 # Enables the use of FPU (no, softfp, hard).
 ifeq ($(USE_FPU),)
-  USE_FPU = no
+  USE_FPU = hard
 endif
 
 # FPU-related options.
@@ -112,12 +112,16 @@ include $(CHIBIOS)/tools/mk/autobuild.mk
 include $(CHIBIOS)/os/hal/lib/streams/streams.mk
 include $(CHIBIOS)/os/various/shell/shell.mk
 
+# Include syscalls for newlib support
+SYSCALLSSRC = $(CHIBIOS)/os/various/syscalls.c
+
 # Define linker script file here.
 LDSCRIPT= $(STARTUPLD)/STM32F401xE.ld
 
 # C sources that can be compiled in ARM or THUMB mode depending on the global
 # setting.
 CSRC = $(ALLCSRC) \
+       $(SYSCALLSSRC) \
        src/as5600/as5600.c \
        src/foc/foc.c \
        main.c  \

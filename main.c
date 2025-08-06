@@ -4,8 +4,13 @@
 #include "shell.h"
 #include <stdlib.h>
 #include <string.h>
+#define _USE_MATH_DEFINES
 #include <math.h>
 #include "chprintf.h"
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
 
 #define LINE_DRV_ENABLE             PAL_LINE(GPIOC, GPIOC_PIN8)
 #define LINE_DRV_N_FAULT            PAL_LINE(GPIOC, GPIOC_PIN10) 
@@ -15,6 +20,9 @@
 #define LINE_DRV_M_PWM              PAL_LINE(GPIOC, GPIOD_PIN9)
 #define LINE_DRV_DEBUG              PAL_LINE(GPIOC, GPIOC_PIN5)
 #define LINE_DRV_DEBUG2             PAL_LINE(GPIOC, GPIOC_PIN6)
+
+static uint32_t last_isr_cycles = 0;
+static uint32_t debug_isr_duration_cycles = 0;
 
 
 /*===========================================================================*/
@@ -31,7 +39,7 @@ static msg_t adc_mailbox_buffer[ADC_MAILBOX_SIZE];
 static mailbox_t adc_mailbox;
 static event_source_t adc_event_source;
 
-#define ADC_EVENT_FLAG (1 << 1)
+#define ADC_EVENT_MASK EVENT_MASK(0)
 
 /*===========================================================================*/
 /* Motor Control PWM                                                         */
@@ -165,6 +173,144 @@ static void pwm_slave_init(void) {
   TIM1->CR1 |= TIM_CR1_CEN;
 }
 
+/*===========================================================================*/
+/* FOC                                                                     */
+/*===========================================================================*/
+#include "foc.h"
+
+static uint16_t next_duty_a_pwm = 0;
+static uint16_t next_duty_b_pwm = 0;
+static uint16_t next_duty_c_pwm = 0;
+
+static void foc_set_pwm(uint16_t duty_a, uint16_t duty_b, uint16_t duty_c) {
+  uint16_t duty_a_pwm = (duty_a * TIM1->ARR) / 10000.0f;
+  uint16_t duty_b_pwm = (duty_b * TIM1->ARR) / 10000.0f;
+  uint16_t duty_c_pwm = (duty_c * TIM1->ARR) / 10000.0f;
+
+  next_duty_a_pwm = duty_a_pwm;
+  next_duty_b_pwm = duty_b_pwm;
+  next_duty_c_pwm = duty_c_pwm;
+}
+
+
+
+/*===========================================================================*/
+/* Angle Control                                                             */
+/*===========================================================================*/
+
+// AS5600 encoder configuration
+#define AS5600_RESOLUTION 4096
+#define AS5600_TO_RADIANS (2.0f * M_PI / AS5600_RESOLUTION)
+
+// Angle control configuration
+#define ANGLE_CONTROL_FREQUENCY_HZ 50.0f
+#define ANGLE_CONTROL_DT (1.0f / ANGLE_CONTROL_FREQUENCY_HZ)
+#define ANGLE_CONTROL_WA_SIZE THD_WORKING_AREA_SIZE(512)
+
+// Angle control state structure
+typedef struct {
+  pid_controller_t angle_pid;     // Reuse FOC PID structure
+  float target_angle;             // Target angle in radians
+  float current_angle;            // Current angle in radians
+  float angle_error;              // For monitoring
+  float torque_output;            // Torque output (current in Amperes, proportional to torque)
+  bool enabled;                   // Control enabled flag
+  systime_t last_update_time;     // For timing
+} angle_control_t;
+
+// Global angle control instance
+static angle_control_t angle_control = {0};
+
+// Update encoder position from ADC data (called from ADC processing)
+static void angle_control_update_position(uint16_t position_adc) {
+  // Convert ADC reading to angle in radians
+  angle_control.current_angle = position_adc * AS5600_TO_RADIANS;
+}
+
+// Initialize angle control system
+static void angle_control_init(float kp, float ki, float kd, float max_torque) {
+  // Initialize PID controller using FOC functions (output is torque via current in Amperes)
+  pid_init(&angle_control.angle_pid, kp, ki, kd, ANGLE_CONTROL_DT, -max_torque, max_torque);
+  
+  angle_control.target_angle = 0.0f;
+  angle_control.current_angle = 0.0f;
+  angle_control.angle_error = 0.0f;
+  angle_control.torque_output = 0.0f;
+  angle_control.enabled = false;
+  angle_control.last_update_time = chVTGetSystemTimeX();
+}
+
+// Set target angle
+static void angle_control_set_target(float target_angle_rad) {
+  angle_control.target_angle = target_angle_rad;
+}
+
+// Enable/disable angle control
+static void angle_control_enable(bool enable) {
+  if (enable && !angle_control.enabled) {
+    // Reset PID when enabling
+    pid_reset(&angle_control.angle_pid);
+    // Current angle will be updated by ADC processing
+  }
+  angle_control.enabled = enable;
+}
+
+// Get current angle
+static float angle_control_get_current_angle(void) {
+  return angle_control.current_angle;
+}
+
+// Get angle error  
+static float angle_control_get_error(void) {
+  return angle_control.angle_error;
+}
+
+// Get torque output
+static float angle_control_get_output(void) {
+  return angle_control.torque_output;
+}
+
+// Angle control thread
+static THD_WORKING_AREA(angle_control_wa, ANGLE_CONTROL_WA_SIZE);
+static THD_FUNCTION(angle_control_thread, arg) {
+  (void)arg;
+  
+  systime_t time = chVTGetSystemTimeX();
+  
+  while (true) {
+    // Wait for next control period (50 Hz = 20ms)
+    time = chThdSleepUntilWindowed(time, time + TIME_MS2I(20));
+    
+    if (angle_control.enabled) {
+      // Current angle is updated by ADC processing, just calculate error
+      // Calculate error (handle wrap-around for angle)
+      angle_control.angle_error = angle_control.target_angle - angle_control.current_angle;
+      
+      // Handle angle wrap-around (-π to π)
+      while (angle_control.angle_error > M_PI) {
+        angle_control.angle_error -= 2.0f * M_PI;
+      }
+      while (angle_control.angle_error < -M_PI) {
+        angle_control.angle_error += 2.0f * M_PI;
+      }
+      
+      // Update PID controller
+      angle_control.torque_output = pid_update(&angle_control.angle_pid, 
+                                              angle_control.target_angle, 
+                                              angle_control.current_angle);
+      
+      // Send torque command to FOC (via current in Amperes)
+      // Note: Torque is proportional to current (Torque = Kt × Current)
+      // The FOC will normalize this: q_ref_normalized = torque_output / FOC_MAX_CURRENT
+      // foc_update(angle_control.current_angle, angle_control.torque_output / FOC_MAX_CURRENT);
+      
+    } else {
+      // When disabled, output zero torque
+      angle_control.torque_output = 0.0f;
+    }
+  }
+}
+
 
 /*===========================================================================*/
 /* Current Sensing                                                           */
@@ -184,7 +330,8 @@ static void pwm_slave_init(void) {
 
 uint32_t phase_current[3] = {0, 0, 0};
 uint32_t position_current = 0;
-uint32_t debug_counter = 0;
+uint32_t debug_counter = 0;        // ADC interrupt counter  
+uint32_t worker_counter = 0;       // Worker thread processing counter
 
 // Pool of ADC data structures to avoid memory allocation in interrupt
 static adc_data_t adc_data_pool[ADC_MAILBOX_SIZE];
@@ -193,9 +340,8 @@ static adc_data_t current_adc_data; // For shell commands
 
 CH_IRQ_HANDLER(STM32_ADC_HANDLER) {
   if (ADC1->SR & ADC_SR_JEOC) {
-    palClearLine(LINE_DRV_DEBUG);
+    debug_isr_duration_cycles = DWT->CYCCNT - last_isr_cycles;
     ADC1->SR &= ~ADC_SR_JEOC; //!!! NEED TO CLEAR BIT IN ISR
-    debug_counter++;
     // Get next buffer from pool (circular buffer)
     adc_data_t *data = &adc_data_pool[pool_index];
     pool_index = (pool_index + 1) % ADC_MAILBOX_SIZE;
@@ -212,10 +358,12 @@ CH_IRQ_HANDLER(STM32_ADC_HANDLER) {
     
     chSysLockFromISR();
     // Post data pointer to mailbox (non-blocking)
-    if (chMBPostI(&adc_mailbox, (msg_t)data) == MSG_OK) {
-      // If successful, trigger event to wake up worker thread
-      chEvtBroadcastI(&adc_event_source);
-    }
+    debug_counter++;
+    msg_t msg = (msg_t)data;
+    chMBPostI(&adc_mailbox, (msg_t)data);
+    // If successful, trigger event to wake up worker thread
+    chEvtBroadcastI(&adc_event_source);
+    
     // If mailbox is full, oldest data is lost (but interrupt doesn't block)
     chSysUnlockFromISR();
   }
@@ -225,7 +373,7 @@ CH_IRQ_HANDLER(STM32_ADC_HANDLER) {
 CH_FAST_IRQ_HANDLER(STM32_TIM4_HANDLER) {
   if (TIM4->SR & TIM_SR_UIF) {       
     TIM4->SR &= ~TIM_SR_UIF;
-    palSetLine(LINE_DRV_DEBUG);
+    last_isr_cycles = DWT->CYCCNT;
   }
 }
 
@@ -293,46 +441,47 @@ static THD_FUNCTION(worker_thread, arg) {
   event_listener_t adc_listener;
   
   // Register to listen for ADC events
-  chEvtRegister(&adc_event_source, &adc_listener, ADC_EVENT_FLAG);
+  chEvtRegister(&adc_event_source, &adc_listener, 0);
+
+  chRegSetThreadName("worker");
   
   while (true) {
-    // Wait for event notification from ADC interrupt
+        // Wait for event notification from ADC interrupt
     eventmask_t events = chEvtWaitAny(ALL_EVENTS);
-    
-    if (events & ADC_EVENT_FLAG) {
+    if (events & ADC_EVENT_MASK) {  // Check for ADC event
       msg_t msg;
       adc_data_t *adc_data;
       
-      // Process all available data from mailbox
-      // This handles bursts of ADC conversions efficiently
-      while (chMBFetchTimeout(&adc_mailbox, &msg, TIME_IMMEDIATE) == MSG_OK) {
+      // Process only one message per event signal
+      if (chMBFetchI(&adc_mailbox, &msg) == MSG_OK) {
         adc_data = (adc_data_t *)msg;
-        
-        // Process ADC data - can do blocking operations safely here
-        // ADC interrupt is not blocked, so real-time performance is maintained
-        
-        // Example processing:
-        uint32_t total_current = adc_data->phase_current[0] + 
-                                adc_data->phase_current[1] + 
-                                adc_data->phase_current[2];
-        
-        // Process position data
-        float position = adc_data->position_current;
-        
-        // You can add:
-        // - Digital filtering (moving average, IIR, etc.)
-        // - Control algorithms (PID, FOC, etc.)
-        // - Data logging
-        // - Fault detection
-        // - Any blocking operations
-        
-        // The adc_data pointer is valid until the next ADC_MAILBOX_SIZE conversions
-        // This gives you time to process without affecting interrupt timing
-      }
-      
-      // Clear the event flag
-      chEvtGetAndClearEvents(ADC_EVENT_FLAG);
-    }
+        worker_counter++;
+         
+        //  uint16_t phase_a_current = adc_data->phase_current[0];
+        //  uint16_t phase_b_current = adc_data->phase_current[1];
+        //  uint16_t phase_c_current = adc_data->phase_current[2];
+        //  uint16_t position = adc_data->position_current;
+         
+        //  // Update angle control with new position data
+        //  angle_control_update_position(position);
+         
+        //  // Convert AS5600 position (0-4095) to radians (0-2π) for FOC
+        //  float position_radians = position * AS5600_TO_RADIANS;
+         
+        //  // Convert ADC values to voltage for FOC
+        //  float ia_volts = (phase_a_current * 3.3f) / 4095.0f;
+        //  float ib_volts = (phase_b_current * 3.3f) / 4095.0f;
+        //  float ic_volts = (phase_c_current * 3.3f) / 4095.0f;
+         
+        //  // Normalize torque output for FOC (torque output is in Amperes, FOC expects 0-1)
+        //  float q_ref_normalized = angle_control.torque_output / FOC_MAX_CURRENT;
+         
+        //  foc_update(position_radians, q_ref_normalized, ia_volts, ib_volts, ic_volts);
+       }
+       
+       // Clear the event flag (CRITICAL - must be done to allow next events)
+       chEvtGetAndClearEvents(ADC_EVENT_MASK);
+     }
   }
 }
 
@@ -383,9 +532,8 @@ static void cmd_check_pwm_trigger(BaseSequentialStream *chp, int argc, char *arg
   
   chprintf(chp, "\nADC Trigger Configuration:\n");
   chprintf(chp, "ADC1->CR2 = 0x%08lx\n", ADC1->CR2);
-  // Temporarily commented out - might be causing hang
-  // chprintf(chp, "Expected JEXTSEL = 0x%lx (TIM4_TRGO)\n", (ADC1->CR2 & ADC_CR2_JEXTSEL_Msk) >> ADC_CR2_JEXTSEL_Pos);
-  // chprintf(chp, "Expected JEXTEN = 0x%lx (Rising edge)\n", (ADC1->CR2 & ADC_CR2_JEXTEN_Msk) >> ADC_CR2_JEXTEN_Pos);
+  chprintf(chp, "Expected JEXTSEL = 0x%lx (TIM4_TRGO)\n", (ADC1->CR2 & ADC_CR2_JEXTSEL_Msk) >> ADC_CR2_JEXTSEL_Pos);
+  chprintf(chp, "Expected JEXTEN = 0x%lx (Rising edge)\n", (ADC1->CR2 & ADC_CR2_JEXTEN_Msk) >> ADC_CR2_JEXTEN_Pos);
 }
 
 static void cmd_adc_registers(BaseSequentialStream *chp, int argc, char *argv[]) {
@@ -439,6 +587,59 @@ static void cmd_adc_status(BaseSequentialStream *chp, int argc, char *argv[]) {
            current_adc_data.position_current);
   chprintf(chp, "Timestamp: %lu\n", (uint32_t)current_adc_data.timestamp);
   chprintf(chp, "Debug counter: %lu\n", debug_counter);
+  chprintf(chp, "Worker counter: %lu\n", worker_counter);
+  chprintf(chp, "Last ISR duration = %lu cycles\n", debug_isr_duration_cycles);
+  chprintf(chp, "Next duty A: %lu, Next duty B: %lu, Next duty C: %lu\n", 
+           next_duty_a_pwm,
+           next_duty_b_pwm,
+           next_duty_c_pwm);
+}
+
+// Shell command to set angle target
+static void cmd_angle_set(BaseSequentialStream *chp, int argc, char *argv[]) {
+  if (argc != 1) {
+    chprintf(chp, "Usage: angle_set <degrees>\n");
+    chprintf(chp, "Example: angle_set 90.0\n");
+    return;
+  }
+  
+  float target_degrees = atof(argv[0]);
+  float target_radians = target_degrees * M_PI / 180.0f;
+  
+  angle_control_set_target(target_radians);
+  chprintf(chp, "Angle target set to %.2f degrees (%.3f rad)\n", target_degrees, target_radians);
+}
+
+// Shell command to enable/disable angle control
+static void cmd_angle_enable(BaseSequentialStream *chp, int argc, char *argv[]) {
+  if (argc != 1) {
+    chprintf(chp, "Usage: angle_enable <0|1>\n");
+    chprintf(chp, "0 = disable, 1 = enable\n");
+    return;
+  }
+  
+  bool enable = (atoi(argv[0]) != 0);
+  angle_control_enable(enable);
+  chprintf(chp, "Angle control %s\n", enable ? "enabled" : "disabled");
+}
+
+// Shell command to get angle status
+static void cmd_angle_status(BaseSequentialStream *chp, int argc, char *argv[]) {
+  (void)argc;
+  (void)argv;
+  
+  float current_deg = angle_control_get_current_angle() * 180.0f / M_PI;
+  float target_deg = angle_control.target_angle * 180.0f / M_PI;
+  float error_deg = angle_control_get_error() * 180.0f / M_PI;
+  float output = angle_control_get_output();
+  
+  chprintf(chp, "Angle Control Status:\n");
+  chprintf(chp, "  Enabled: %s\n", angle_control.enabled ? "YES" : "NO");
+  chprintf(chp, "  Current: %.2f deg (%.3f rad)\n", current_deg, angle_control_get_current_angle());
+  chprintf(chp, "  Target:  %.2f deg (%.3f rad)\n", target_deg, angle_control.target_angle);
+  chprintf(chp, "  Error:   %.2f deg (%.3f rad)\n", error_deg, angle_control_get_error());
+  chprintf(chp, "  Torque Output: %.3f A (current ∝ torque)\n", output);
+  chprintf(chp, "  Raw ADC: %lu\n", current_adc_data.position_current);
 }
 
 static const ShellCommand shell_commands[] = {
@@ -447,6 +648,9 @@ static const ShellCommand shell_commands[] = {
   {"test_adc", cmd_test_adc_manual},      // Manual ADC trigger test
   {"test_pwm", cmd_check_pwm_trigger},    // PWM timer test  
   {"registers", cmd_adc_registers},       // Register dump
+  {"angle_set", cmd_angle_set},           // Set angle target
+  {"angle_enable", cmd_angle_enable},     // Enable/disable angle control
+  {"angle_status", cmd_angle_status},     // Get angle status
   {NULL, NULL},
 };
 
@@ -484,7 +688,7 @@ int main(void) {
   chEvtObjectInit(&adc_event_source);
 
   // Start worker thread for mailbox + event processing
-  chThdCreateStatic(worker_wa, sizeof(worker_wa), NORMALPRIO + 2, worker_thread, NULL);
+  chThdCreateStatic(worker_wa, sizeof(worker_wa), NORMALPRIO + 10, worker_thread, NULL);
 
   adc_init();
   pwm_init();
@@ -492,7 +696,15 @@ int main(void) {
   pwm_set_duty_cycle(0, 10);
   pwm_set_duty_cycle(1, 10);
   pwm_set_duty_cycle(2, 10);
+  
+  // Initialize angle control system 
+  // PID gains: kp=0.01, ki=0.001, kd=0.0001, max_torque=1.0A
+  angle_control_init(0.01f, 0.001f, 0.0001f, 1.0f);
 
+  foc_init(PWM_FREQ, foc_set_pwm);  // 21 kHz sample rate
+  
+  // Start angle control thread
+  chThdCreateStatic(angle_control_wa, sizeof(angle_control_wa), NORMALPRIO + 1, angle_control_thread, NULL);
 
   palSetLineMode(LINE_DRV_N_FAULT, PAL_MODE_INPUT_PULLDOWN);
   palSetLineMode(LINE_DRV_N_OCTW, PAL_MODE_INPUT_PULLDOWN);
