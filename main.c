@@ -190,7 +190,7 @@ static adc_data_t adc_data_pool[ADC_MAILBOX_SIZE];
 static uint8_t pool_index = 0;
 static adc_data_t current_adc_data; // For shell commands
 
-CH_FAST_IRQ_HANDLER(STM32_ADC_HANDLER) {
+CH_IRQ_HANDLER(STM32_ADC_HANDLER) {
   if (ADC1->SR & ADC_SR_JEOC) {
     palClearLine(LINE_DRV_DEBUG);
     ADC1->SR &= ~ADC_SR_JEOC; //!!! NEED TO CLEAR BIT IN ISR
