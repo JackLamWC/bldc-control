@@ -34,12 +34,7 @@ typedef struct {
   systime_t timestamp;
 } adc_data_t;
 
-#define ADC_MAILBOX_SIZE 8
-static msg_t adc_mailbox_buffer[ADC_MAILBOX_SIZE];
-static mailbox_t adc_mailbox;
-static event_source_t adc_event_source;
-
-#define ADC_EVENT_MASK EVENT_MASK(0)
+// Mailbox and event system removed - FOC now runs directly in ISR
 
 /*===========================================================================*/
 /* Motor Control PWM                                                         */
@@ -330,42 +325,77 @@ static THD_FUNCTION(angle_control_thread, arg) {
 
 uint32_t phase_current[3] = {0, 0, 0};
 uint32_t position_current = 0;
-uint32_t debug_counter = 0;        // ADC interrupt counter  
-uint32_t worker_counter = 0;       // Worker thread processing counter
+uint32_t debug_counter = 0;        // ADC interrupt counter
 
-// Pool of ADC data structures to avoid memory allocation in interrupt
-static adc_data_t adc_data_pool[ADC_MAILBOX_SIZE];
-static uint8_t pool_index = 0;
-static adc_data_t current_adc_data; // For shell commands
+// ISR profiling variables
+static uint32_t timing_adc_read = 0;
+static uint32_t timing_conversions = 0;
+static uint32_t timing_angle_update = 0;
+static uint32_t timing_foc_computation = 0;
+
+// FOC detailed profiling variables (accessible from foc.c)
+uint32_t foc_timing_current_conversion = 0;
+uint32_t foc_timing_clarke_transform = 0;
+uint32_t foc_timing_park_transform = 0;
+uint32_t foc_timing_pid_controllers = 0;
+uint32_t foc_timing_inverse_park = 0;
+uint32_t foc_timing_inverse_clarke = 0;
+uint32_t foc_timing_pwm_conversion = 0;
+
+// Single ADC data structure for debugging/shell commands  
+static adc_data_t current_adc_data;
 
 CH_IRQ_HANDLER(STM32_ADC_HANDLER) {
   if (ADC1->SR & ADC_SR_JEOC) {
-    debug_isr_duration_cycles = DWT->CYCCNT - last_isr_cycles;
-    ADC1->SR &= ~ADC_SR_JEOC; //!!! NEED TO CLEAR BIT IN ISR
-    // Get next buffer from pool (circular buffer)
-    adc_data_t *data = &adc_data_pool[pool_index];
-    pool_index = (pool_index + 1) % ADC_MAILBOX_SIZE;
+    uint32_t start_cycles = DWT->CYCCNT;
+    uint32_t checkpoint;
+    ADC1->SR &= ~ADC_SR_JEOC; // Clear interrupt flag
     
-    // Fill ADC data
-    data->phase_current[0] = ADC1->JDR1 & ADC_JDR1_JDATA_Msk;
-    data->phase_current[1] = ADC1->JDR2 & ADC_JDR2_JDATA_Msk;
-    data->phase_current[2] = ADC1->JDR3 & ADC_JDR3_JDATA_Msk;
-    data->position_current = ADC1->JDR4 & ADC_JDR4_JDATA_Msk;
-    data->timestamp = chVTGetSystemTimeX();
+    // === SECTION 1: ADC Reading ===
+    uint16_t phase_a_current = ADC1->JDR1 & ADC_JDR1_JDATA_Msk;
+    uint16_t phase_b_current = ADC1->JDR2 & ADC_JDR2_JDATA_Msk;
+    uint16_t phase_c_current = ADC1->JDR3 & ADC_JDR3_JDATA_Msk;
+    uint16_t position = ADC1->JDR4 & ADC_JDR4_JDATA_Msk;
     
-    // Also update current_adc_data for shell commands
-    current_adc_data = *data;
+    // Update current_adc_data for shell commands
+    current_adc_data.phase_current[0] = phase_a_current;
+    current_adc_data.phase_current[1] = phase_b_current;
+    current_adc_data.phase_current[2] = phase_c_current;
+    current_adc_data.position_current = position;
+    current_adc_data.timestamp = chVTGetSystemTimeX();
     
-    chSysLockFromISR();
-    // Post data pointer to mailbox (non-blocking)
+    checkpoint = DWT->CYCCNT;
+    timing_adc_read = checkpoint - start_cycles;
+    
+    // === SECTION 2: Angle Control Update ===
+    angle_control_update_position(position);
+    
+    checkpoint = DWT->CYCCNT;
+    timing_angle_update = checkpoint - start_cycles - timing_adc_read;
+    
+    // === SECTION 3: ADC to Float Conversions ===
+    float ia_volts = (phase_a_current * 3.3f) / 4095.0f;
+    float ib_volts = (phase_b_current * 3.3f) / 4095.0f;
+    float ic_volts = (phase_c_current * 3.3f) / 4095.0f;
+    
+    // Convert AS5600 position (0-4095) to radians (0-2π) for FOC
+    float position_radians = position * AS5600_TO_RADIANS;
+    
+    // Get torque reference from angle control (thread-safe read)
+    float q_ref_normalized = angle_control.torque_output;
+    
+    checkpoint = DWT->CYCCNT;
+    timing_conversions = checkpoint - start_cycles - timing_adc_read - timing_angle_update;
+    
+    // === SECTION 4: FOC Computation ===
+    foc_update_optimized(position_radians, q_ref_normalized, ia_volts, ib_volts, ic_volts);
+    
+    checkpoint = DWT->CYCCNT;
+    timing_foc_computation = checkpoint - start_cycles - timing_adc_read - timing_angle_update - timing_conversions;
+    
+    // Measure total ISR duration
+    debug_isr_duration_cycles = DWT->CYCCNT - start_cycles;
     debug_counter++;
-    msg_t msg = (msg_t)data;
-    chMBPostI(&adc_mailbox, (msg_t)data);
-    // If successful, trigger event to wake up worker thread
-    chEvtBroadcastI(&adc_event_source);
-    
-    // If mailbox is full, oldest data is lost (but interrupt doesn't block)
-    chSysUnlockFromISR();
   }
 }
 
@@ -432,58 +462,7 @@ static void adc_init(void) {
 /*===========================================================================*/
 /* Worker Thread for Mailbox + Event Processing                             */
 /*===========================================================================*/
-#define WORKER_WA_SIZE THD_WORKING_AREA_SIZE(1024)
-
-static THD_WORKING_AREA(worker_wa, WORKER_WA_SIZE);
-static THD_FUNCTION(worker_thread, arg) {
-  (void)arg;
-  
-  event_listener_t adc_listener;
-  
-  // Register to listen for ADC events
-  chEvtRegister(&adc_event_source, &adc_listener, 0);
-
-  chRegSetThreadName("worker");
-  
-  while (true) {
-        // Wait for event notification from ADC interrupt
-    eventmask_t events = chEvtWaitAny(ALL_EVENTS);
-    if (events & ADC_EVENT_MASK) {  // Check for ADC event
-      msg_t msg;
-      adc_data_t *adc_data;
-      
-      // Process only one message per event signal
-      if (chMBFetchI(&adc_mailbox, &msg) == MSG_OK) {
-        adc_data = (adc_data_t *)msg;
-        worker_counter++;
-         
-        //  uint16_t phase_a_current = adc_data->phase_current[0];
-        //  uint16_t phase_b_current = adc_data->phase_current[1];
-        //  uint16_t phase_c_current = adc_data->phase_current[2];
-        //  uint16_t position = adc_data->position_current;
-         
-        //  // Update angle control with new position data
-        //  angle_control_update_position(position);
-         
-        //  // Convert AS5600 position (0-4095) to radians (0-2π) for FOC
-        //  float position_radians = position * AS5600_TO_RADIANS;
-         
-        //  // Convert ADC values to voltage for FOC
-        //  float ia_volts = (phase_a_current * 3.3f) / 4095.0f;
-        //  float ib_volts = (phase_b_current * 3.3f) / 4095.0f;
-        //  float ic_volts = (phase_c_current * 3.3f) / 4095.0f;
-         
-        //  // Normalize torque output for FOC (torque output is in Amperes, FOC expects 0-1)
-        //  float q_ref_normalized = angle_control.torque_output / FOC_MAX_CURRENT;
-         
-        //  foc_update(position_radians, q_ref_normalized, ia_volts, ib_volts, ic_volts);
-       }
-       
-       // Clear the event flag (CRITICAL - must be done to allow next events)
-       chEvtGetAndClearEvents(ADC_EVENT_MASK);
-     }
-  }
-}
+// Worker thread removed - FOC now runs directly in ADC ISR for ultra-low latency
 
 /*===========================================================================*/
 /* Shell                                                                     */
@@ -572,27 +551,121 @@ static void cmd_adc_status(BaseSequentialStream *chp, int argc, char *argv[]) {
   (void)argc;
   (void)argv;
   
-  chprintf(chp, "ADC Mailbox + Events Status:\n");
-  chprintf(chp, "Mailbox size: %d\n", ADC_MAILBOX_SIZE);
-  chprintf(chp, "Mailbox used slots: %d\n", chMBGetUsedCountI(&adc_mailbox));
-  chprintf(chp, "Mailbox free slots: %d\n", chMBGetFreeCountI(&adc_mailbox));
-  chprintf(chp, "Pool index: %d\n", pool_index);
-  chprintf(chp, "\nLatest ADC Data:\n");
-  chprintf(chp, "Phase A: %lu, Phase B: %lu, Phase C: %lu\n", 
-           current_adc_data.phase_current[0],
-           current_adc_data.phase_current[1], 
-           current_adc_data.phase_current[2]);
-  chprintf(chp, "Position: %lu\n", 
-           current_adc_data.position_current,
-           current_adc_data.position_current);
+  chprintf(chp, "ADC + FOC Status (now in ISR):\n");
+  // chprintf(chp, "\nLatest ADC Data:\n");
+  // chprintf(chp, "Phase A: %lu, Phase B: %lu, Phase C: %lu\n", 
+  //          current_adc_data.phase_current[0],
+  //          current_adc_data.phase_current[1], 
+  //          current_adc_data.phase_current[2]);
+  // chprintf(chp, "Position: %lu\n", 
+  //          current_adc_data.position_current,
+  //          current_adc_data.position_current);
   chprintf(chp, "Timestamp: %lu\n", (uint32_t)current_adc_data.timestamp);
   chprintf(chp, "Debug counter: %lu\n", debug_counter);
-  chprintf(chp, "Worker counter: %lu\n", worker_counter);
-  chprintf(chp, "Last ISR duration = %lu cycles\n", debug_isr_duration_cycles);
+  chprintf(chp, "Last ISR duration = %lu cycles (including FOC)\n", debug_isr_duration_cycles);
   chprintf(chp, "Next duty A: %lu, Next duty B: %lu, Next duty C: %lu\n", 
            next_duty_a_pwm,
            next_duty_b_pwm,
            next_duty_c_pwm);
+}
+
+// Shell command to show ISR timing breakdown
+static void cmd_timing_profile(BaseSequentialStream *chp, int argc, char *argv[]) {
+  (void)argc;
+  (void)argv;
+  
+  float freq_mhz = 84.0f; // System clock in MHz
+  
+  chprintf(chp, "ISR Timing Profile (last interrupt):\n");
+  chprintf(chp, "===========================================\n");
+  chprintf(chp, "Section 1 - ADC Read & Data Update:\n");
+  chprintf(chp, "  Cycles: %lu (%.2f μs, %.1f%%)\n", 
+           timing_adc_read, 
+           timing_adc_read / freq_mhz,
+           (timing_adc_read * 100.0f) / debug_isr_duration_cycles);
+  
+  chprintf(chp, "Section 2 - Angle Control Update:\n");
+  chprintf(chp, "  Cycles: %lu (%.2f μs, %.1f%%)\n", 
+           timing_angle_update, 
+           timing_angle_update / freq_mhz,
+           (timing_angle_update * 100.0f) / debug_isr_duration_cycles);
+  
+  chprintf(chp, "Section 3 - Float Conversions:\n");
+  chprintf(chp, "  Cycles: %lu (%.2f μs, %.1f%%)\n", 
+           timing_conversions, 
+           timing_conversions / freq_mhz,
+           (timing_conversions * 100.0f) / debug_isr_duration_cycles);
+  
+  chprintf(chp, "Section 4 - FOC Computation:\n");
+  chprintf(chp, "  Cycles: %lu (%.2f μs, %.1f%%)\n", 
+           timing_foc_computation, 
+           timing_foc_computation / freq_mhz,
+           (timing_foc_computation * 100.0f) / debug_isr_duration_cycles);
+  
+  chprintf(chp, "===========================================\n");
+  chprintf(chp, "TOTAL ISR Duration: %lu cycles (%.2f μs)\n", 
+           debug_isr_duration_cycles,
+           debug_isr_duration_cycles / freq_mhz);
+  chprintf(chp, "Available budget:   4000 cycles (47.6 μs)\n");
+  chprintf(chp, "CPU Usage: %.1f%%\n", (debug_isr_duration_cycles * 100.0f) / 4000.0f);
+}
+
+// Shell command to show detailed FOC timing breakdown
+static void cmd_foc_timing(BaseSequentialStream *chp, int argc, char *argv[]) {
+  (void)argc;
+  (void)argv;
+  
+  float freq_mhz = 84.0f; // System clock in MHz
+  
+  chprintf(chp, "FOC Detailed Timing Profile (last interrupt):\n");
+  chprintf(chp, "===========================================\n");
+  chprintf(chp, "Step 1 - Current Conversion:\n");
+  chprintf(chp, "  Cycles: %lu (%.2f μs, %.1f%%)\n", 
+           foc_timing_current_conversion, 
+           foc_timing_current_conversion / freq_mhz,
+           (foc_timing_current_conversion * 100.0f) / timing_foc_computation);
+  
+  chprintf(chp, "Step 2 - Clarke Transform:\n");
+  chprintf(chp, "  Cycles: %lu (%.2f μs, %.1f%%)\n", 
+           foc_timing_clarke_transform, 
+           foc_timing_clarke_transform / freq_mhz,
+           (foc_timing_clarke_transform * 100.0f) / timing_foc_computation);
+  
+  chprintf(chp, "Step 3 - Park Transform (sin/cos):\n");
+  chprintf(chp, "  Cycles: %lu (%.2f μs, %.1f%%)\n", 
+           foc_timing_park_transform, 
+           foc_timing_park_transform / freq_mhz,
+           (foc_timing_park_transform * 100.0f) / timing_foc_computation);
+  
+  chprintf(chp, "Step 4 - PID Controllers:\n");
+  chprintf(chp, "  Cycles: %lu (%.2f μs, %.1f%%)\n", 
+           foc_timing_pid_controllers, 
+           foc_timing_pid_controllers / freq_mhz,
+           (foc_timing_pid_controllers * 100.0f) / timing_foc_computation);
+  
+  chprintf(chp, "Step 5 - Inverse Park (sin/cos):\n");
+  chprintf(chp, "  Cycles: %lu (%.2f μs, %.1f%%)\n", 
+           foc_timing_inverse_park, 
+           foc_timing_inverse_park / freq_mhz,
+           (foc_timing_inverse_park * 100.0f) / timing_foc_computation);
+  
+  chprintf(chp, "Step 6 - Inverse Clarke:\n");
+  chprintf(chp, "  Cycles: %lu (%.2f μs, %.1f%%)\n", 
+           foc_timing_inverse_clarke, 
+           foc_timing_inverse_clarke / freq_mhz,
+           (foc_timing_inverse_clarke * 100.0f) / timing_foc_computation);
+  
+  chprintf(chp, "Step 7 - PWM Conversion & Output:\n");
+  chprintf(chp, "  Cycles: %lu (%.2f μs, %.1f%%)\n", 
+           foc_timing_pwm_conversion, 
+           foc_timing_pwm_conversion / freq_mhz,
+           (foc_timing_pwm_conversion * 100.0f) / timing_foc_computation);
+  
+  chprintf(chp, "===========================================\n");
+  chprintf(chp, "TOTAL FOC: %lu cycles (%.2f μs)\n", 
+           timing_foc_computation,
+           timing_foc_computation / freq_mhz);
+  chprintf(chp, "Expected sin/cos calls: 4x (Park + Inverse Park)\n");
 }
 
 // Shell command to set angle target
@@ -645,6 +718,8 @@ static void cmd_angle_status(BaseSequentialStream *chp, int argc, char *argv[]) 
 static const ShellCommand shell_commands[] = {
   {"adc", cmd_get_adc},
   {"status", cmd_adc_status},
+  {"timing", cmd_timing_profile},         // ISR timing breakdown
+  {"foc_timing", cmd_foc_timing},         // Detailed FOC timing
   {"test_adc", cmd_test_adc_manual},      // Manual ADC trigger test
   {"test_pwm", cmd_check_pwm_trigger},    // PWM timer test  
   {"registers", cmd_adc_registers},       // Register dump
@@ -681,14 +756,7 @@ int main(void) {
   sdStart(&SD2, &sd2_config);
   shellInit();
 
-  // Initialize mailbox for ADC data passing
-  chMBObjectInit(&adc_mailbox, adc_mailbox_buffer, ADC_MAILBOX_SIZE);
-  
-  // Initialize event source for ADC notifications
-  chEvtObjectInit(&adc_event_source);
-
-  // Start worker thread for mailbox + event processing
-  chThdCreateStatic(worker_wa, sizeof(worker_wa), NORMALPRIO + 10, worker_thread, NULL);
+  // Mailbox/event system removed - FOC now runs directly in ADC ISR
 
   adc_init();
   pwm_init();
@@ -696,7 +764,7 @@ int main(void) {
   pwm_set_duty_cycle(0, 10);
   pwm_set_duty_cycle(1, 10);
   pwm_set_duty_cycle(2, 10);
-  
+
   // Initialize angle control system 
   // PID gains: kp=0.01, ki=0.001, kd=0.0001, max_torque=1.0A
   angle_control_init(0.01f, 0.001f, 0.0001f, 1.0f);
@@ -719,6 +787,6 @@ int main(void) {
   while (true) {
     thread_t *shell_thd = chThdCreateFromHeap(NULL, SHELL_WA_SIZE, "shell", NORMALPRIO + 1, shellThread, (void *)&shell_cfg);
     chThdWait(shell_thd);
-    chThdSleepMilliseconds(500);
+    chThdSleepMilliseconds(1);
   }
 }

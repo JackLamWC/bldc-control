@@ -6,9 +6,11 @@
 
 #define FOC_CURRENT_SENSING_VOLTAGE_OFFSET 0.5f
 #define FOC_CURRENT_SENSING_VOLTAGE_MAX 3.3f
-#define FOC_CURRENT_SENSING_R_SENSE 0.005
+#define FOC_CURRENT_SENSING_R_SENSE 0.005f
 #define FOC_CURRENT_SENSING_GAIN 12.22f
-#define FOC_CURRENT_GET_CURRENT_F(CSH_V) ((CSH_V - FOC_CURRENT_SENSING_VOLTAGE_OFFSET) / (FOC_CURRENT_SENSING_R_SENSE * FOC_CURRENT_SENSING_GAIN))
+// Precomputed division constant: 1 / (0.005 * 12.22) = 16.367
+#define FOC_CURRENT_SENSING_INV_GAIN 16.367f
+#define FOC_CURRENT_GET_CURRENT_F(CSH_V) ((CSH_V - FOC_CURRENT_SENSING_VOLTAGE_OFFSET) * FOC_CURRENT_SENSING_INV_GAIN)
 
 #include "ch.h"
 
@@ -41,4 +43,14 @@ void foc_get_d_pid_output(float d, float d_ref, float *d_pid_output);
 void foc_inverse_park_transform(float d, float q, float theta, float *v_alpha, float *v_beta);
 void foc_inverse_clarke_transform(float alpha, float beta, float *va, float *vb, float *vc);
 void foc_update(float theta, float q_ref, float ia_volts, float ib_volts, float ic_volts);
+void foc_update_optimized(float theta, float q_ref, float ia_volts, float ib_volts, float ic_volts);
+
+// Timing profiling variables (extern - defined in main.c)
+extern uint32_t foc_timing_current_conversion;
+extern uint32_t foc_timing_clarke_transform;
+extern uint32_t foc_timing_park_transform;
+extern uint32_t foc_timing_pid_controllers;
+extern uint32_t foc_timing_inverse_park;
+extern uint32_t foc_timing_inverse_clarke;
+extern uint32_t foc_timing_pwm_conversion;
 #endif

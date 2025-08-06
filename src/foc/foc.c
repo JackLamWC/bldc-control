@@ -1,8 +1,69 @@
 #include "foc.h"
+#define _USE_MATH_DEFINES
 #include <math.h>
 #include <stdint.h>
 
-#define SQRT_3_BY_2 0.86602540378443864676372317075294
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
+
+// Mathematical constants for transforms (optimized for speed)
+#define SQRT_3_BY_2 0.866025403784f  // sqrt(3)/2 as float
+#define TWO_BY_3    0.666666666667f  // 2/3
+
+// Fast sin/cos lookup table (256 entries for 0-2π)
+#define SINCOS_TABLE_SIZE 256
+#define SINCOS_SCALE (SINCOS_TABLE_SIZE / (2.0f * M_PI))
+
+static const float sin_table[SINCOS_TABLE_SIZE] = {
+    0.000000f, 0.024541f, 0.049068f, 0.073565f, 0.098017f, 0.122411f, 0.146730f, 0.170962f,
+    0.195090f, 0.219101f, 0.242980f, 0.266713f, 0.290285f, 0.313682f, 0.336890f, 0.359895f,
+    0.382683f, 0.405241f, 0.427555f, 0.449611f, 0.471397f, 0.492898f, 0.514103f, 0.534998f,
+    0.555570f, 0.575808f, 0.595699f, 0.615232f, 0.634393f, 0.653173f, 0.671559f, 0.689541f,
+    0.707107f, 0.724247f, 0.740951f, 0.757209f, 0.773010f, 0.788346f, 0.803208f, 0.817585f,
+    0.831470f, 0.844854f, 0.857729f, 0.870087f, 0.881921f, 0.893224f, 0.903989f, 0.914210f,
+    0.923880f, 0.932993f, 0.941544f, 0.949528f, 0.956940f, 0.963776f, 0.970031f, 0.975702f,
+    0.980785f, 0.985278f, 0.989177f, 0.992480f, 0.995185f, 0.997290f, 0.998795f, 0.999699f,
+    1.000000f, 0.999699f, 0.998795f, 0.997290f, 0.995185f, 0.992480f, 0.989177f, 0.985278f,
+    0.980785f, 0.975702f, 0.970031f, 0.963776f, 0.956940f, 0.949528f, 0.941544f, 0.932993f,
+    0.923880f, 0.914210f, 0.903989f, 0.893224f, 0.881921f, 0.870087f, 0.857729f, 0.844854f,
+    0.831470f, 0.817585f, 0.803208f, 0.788346f, 0.773010f, 0.757209f, 0.740951f, 0.724247f,
+    0.707107f, 0.689541f, 0.671559f, 0.653173f, 0.634393f, 0.615232f, 0.595699f, 0.575808f,
+    0.555570f, 0.534998f, 0.514103f, 0.492898f, 0.471397f, 0.449611f, 0.427555f, 0.405241f,
+    0.382683f, 0.359895f, 0.336890f, 0.313682f, 0.290285f, 0.266713f, 0.242980f, 0.219101f,
+    0.195090f, 0.170962f, 0.146730f, 0.122411f, 0.098017f, 0.073565f, 0.049068f, 0.024541f,
+    0.000000f, -0.024541f, -0.049068f, -0.073565f, -0.098017f, -0.122411f, -0.146730f, -0.170962f,
+    -0.195090f, -0.219101f, -0.242980f, -0.266713f, -0.290285f, -0.313682f, -0.336890f, -0.359895f,
+    -0.382683f, -0.405241f, -0.427555f, -0.449611f, -0.471397f, -0.492898f, -0.514103f, -0.534998f,
+    -0.555570f, -0.575808f, -0.595699f, -0.615232f, -0.634393f, -0.653173f, -0.671559f, -0.689541f,
+    -0.707107f, -0.724247f, -0.740951f, -0.757209f, -0.773010f, -0.788346f, -0.803208f, -0.817585f,
+    -0.831470f, -0.844854f, -0.857729f, -0.870087f, -0.881921f, -0.893224f, -0.903989f, -0.914210f,
+    -0.923880f, -0.932993f, -0.941544f, -0.949528f, -0.956940f, -0.963776f, -0.970031f, -0.975702f,
+    -0.980785f, -0.985278f, -0.989177f, -0.992480f, -0.995185f, -0.997290f, -0.998795f, -0.999699f,
+    -1.000000f, -0.999699f, -0.998795f, -0.997290f, -0.995185f, -0.992480f, -0.989177f, -0.985278f,
+    -0.980785f, -0.975702f, -0.970031f, -0.963776f, -0.956940f, -0.949528f, -0.941544f, -0.932993f,
+    -0.923880f, -0.914210f, -0.903989f, -0.893224f, -0.881921f, -0.870087f, -0.857729f, -0.844854f,
+    -0.831470f, -0.817585f, -0.803208f, -0.788346f, -0.773010f, -0.757209f, -0.740951f, -0.724247f,
+    -0.707107f, -0.689541f, -0.671559f, -0.653173f, -0.634393f, -0.615232f, -0.595699f, -0.575808f,
+    -0.555570f, -0.534998f, -0.514103f, -0.492898f, -0.471397f, -0.449611f, -0.427555f, -0.405241f,
+    -0.382683f, -0.359895f, -0.336890f, -0.313682f, -0.290285f, -0.266713f, -0.242980f, -0.219101f,
+    -0.195090f, -0.170962f, -0.146730f, -0.122411f, -0.098017f, -0.073565f, -0.049068f, -0.024541f
+};
+
+// Fast sin/cos lookup functions
+static inline float fast_sin(float angle) {
+    // Normalize angle to [0, 2π)
+    while (angle < 0.0f) angle += 2.0f * M_PI;
+    while (angle >= 2.0f * M_PI) angle -= 2.0f * M_PI;
+    
+    int index = (int)(angle * SINCOS_SCALE) & (SINCOS_TABLE_SIZE - 1);
+    return sin_table[index];
+}
+
+static inline float fast_cos(float angle) {
+    // cos(x) = sin(x + π/2)
+    return fast_sin(angle + M_PI * 0.5f);
+}
 
 // Global PID controllers for d and q axis
 static pid_controller_t d_pid;
@@ -189,4 +250,87 @@ void foc_update(float theta, float q_ref, float ia_volts, float ib_volts, float 
     
     // Apply duty cycles using the function pointer
     foc_set_pwm(duty_a_pwm, duty_b_pwm, duty_c_pwm);
+}
+
+// Optimized FOC function with all transforms inlined and lookup tables
+void foc_update_optimized(float theta, float q_ref, float ia_volts, float ib_volts, float ic_volts) {
+    // Check if function pointer is set
+    if (foc_set_pwm == NULL) {
+        return; // Hardware function not initialized
+    }
+
+    // Timing measurements using DWT cycle counter
+    extern volatile uint32_t *DWT_CYCCNT;
+    uint32_t start_cycles = *((volatile uint32_t *)0xE0001004); // DWT->CYCCNT
+    uint32_t checkpoint;
+
+    // === STEP 1: Current Conversion (optimized) ===
+    float ia_f = (ia_volts - FOC_CURRENT_SENSING_VOLTAGE_OFFSET) * FOC_CURRENT_SENSING_INV_GAIN;
+    float ib_f = (ib_volts - FOC_CURRENT_SENSING_VOLTAGE_OFFSET) * FOC_CURRENT_SENSING_INV_GAIN;
+    float ic_f = (ic_volts - FOC_CURRENT_SENSING_VOLTAGE_OFFSET) * FOC_CURRENT_SENSING_INV_GAIN;
+
+    checkpoint = *((volatile uint32_t *)0xE0001004);
+    foc_timing_current_conversion = checkpoint - start_cycles;
+
+    // === STEP 2: Clarke Transform (inlined) ===
+    float alpha = ia_f - 0.5f * ib_f - 0.5f * ic_f;
+    float beta = SQRT_3_BY_2 * (ib_f - ic_f);
+
+    checkpoint = *((volatile uint32_t *)0xE0001004);
+    foc_timing_clarke_transform = checkpoint - start_cycles - foc_timing_current_conversion;
+
+    // === STEP 3: Park Transform (inlined with hardware FPU) ===
+    float cos_theta = cosf(theta);
+    float sin_theta = sinf(theta);
+    float d = alpha * cos_theta + beta * sin_theta;
+    float q = -alpha * sin_theta + beta * cos_theta;
+
+    checkpoint = *((volatile uint32_t *)0xE0001004);
+    foc_timing_park_transform = checkpoint - start_cycles - foc_timing_current_conversion - foc_timing_clarke_transform;
+
+    // === STEP 4: PID Controllers ===
+    float d_ref = 0.0f;
+    float d_pid_output = pid_update(&d_pid, d_ref, d);
+    
+    float q_ref_scaled = q_ref * FOC_MAX_CURRENT;
+    float q_pid_output = pid_update(&q_pid, q_ref_scaled, q);
+
+    checkpoint = *((volatile uint32_t *)0xE0001004);
+    foc_timing_pid_controllers = checkpoint - start_cycles - foc_timing_current_conversion - foc_timing_clarke_transform - foc_timing_park_transform;
+
+    // === STEP 5: Inverse Park Transform (inlined, reuse sin/cos) ===
+    float v_alpha = d_pid_output * cos_theta - q_pid_output * sin_theta;
+    float v_beta = d_pid_output * sin_theta + q_pid_output * cos_theta;
+
+    checkpoint = *((volatile uint32_t *)0xE0001004);
+    foc_timing_inverse_park = checkpoint - start_cycles - foc_timing_current_conversion - foc_timing_clarke_transform - foc_timing_park_transform - foc_timing_pid_controllers;
+
+    // === STEP 6: Inverse Clarke Transform (inlined) ===
+    float va = v_alpha;
+    float vb = -0.5f * v_alpha + SQRT_3_BY_2 * v_beta;
+    float vc = -0.5f * v_alpha - SQRT_3_BY_2 * v_beta;
+
+    checkpoint = *((volatile uint32_t *)0xE0001004);
+    foc_timing_inverse_clarke = checkpoint - start_cycles - foc_timing_current_conversion - foc_timing_clarke_transform - foc_timing_park_transform - foc_timing_pid_controllers - foc_timing_inverse_park;
+    
+    // === STEP 7: PWM Conversion (optimized) ===
+    // Precomputed constant: 5000 / FOC_BATTERY_VOLTAGE = 416.667
+    const float pwm_scale = 416.6667f;
+    const float pwm_offset = 5000.0f;
+    
+    // Fast float-to-int conversion with optimized clamping
+    int32_t duty_a_raw = (int32_t)(va * pwm_scale + pwm_offset);
+    int32_t duty_b_raw = (int32_t)(vb * pwm_scale + pwm_offset);
+    int32_t duty_c_raw = (int32_t)(vc * pwm_scale + pwm_offset);
+    
+    // Branchless clamping for better performance
+    uint16_t duty_a_pwm = (duty_a_raw < 0) ? 0 : ((duty_a_raw > 10000) ? 10000 : (uint16_t)duty_a_raw);
+    uint16_t duty_b_pwm = (duty_b_raw < 0) ? 0 : ((duty_b_raw > 10000) ? 10000 : (uint16_t)duty_b_raw);
+    uint16_t duty_c_pwm = (duty_c_raw < 0) ? 0 : ((duty_c_raw > 10000) ? 10000 : (uint16_t)duty_c_raw);
+    
+    // Apply duty cycles
+    foc_set_pwm(duty_a_pwm, duty_b_pwm, duty_c_pwm);
+
+    checkpoint = *((volatile uint32_t *)0xE0001004);
+    foc_timing_pwm_conversion = checkpoint - start_cycles - foc_timing_current_conversion - foc_timing_clarke_transform - foc_timing_park_transform - foc_timing_pid_controllers - foc_timing_inverse_park - foc_timing_inverse_clarke;
 }
