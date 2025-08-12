@@ -72,6 +72,10 @@ static pid_controller_t q_pid;
 // Global function pointer for hardware abstraction
 foc_set_pwm_func_t foc_set_pwm = NULL;
 
+// Debug variables for d-axis reference override
+static bool d_ref_override_enabled = false;
+static float d_ref_override_value = 0.0f;
+
 // PID Controller Functions
 void pid_init(pid_controller_t *pid, float kp, float ki, float kd, float dt, float output_min, float output_max) {
     pid->kp = kp;
@@ -119,6 +123,40 @@ float pid_update(pid_controller_t *pid, float setpoint, float process_variable) 
     return output;
 }
 
+// New function for angular PID control that accepts pre-calculated error
+float pid_update_with_error(pid_controller_t *pid, float error) {
+    // Proportional term
+    float proportional = pid->kp * error;
+    
+    // Integral term
+    pid->integral += error * pid->dt;
+    float integral = pid->ki * pid->integral;
+    
+    // Derivative term
+    float derivative = pid->kd * (error - pid->prev_error) / pid->dt;
+    pid->prev_error = error;
+    
+    // Calculate output
+    float output = proportional + integral + derivative;
+    
+    // Apply output limits
+    if (output > pid->output_max) {
+        output = pid->output_max;
+        // Anti-windup: prevent integral from growing when output is saturated
+        if (pid->ki != 0.0f) {
+            pid->integral = (output - proportional - derivative) / pid->ki;
+        }
+    } else if (output < pid->output_min) {
+        output = pid->output_min;
+        // Anti-windup: prevent integral from growing when output is saturated
+        if (pid->ki != 0.0f) {
+            pid->integral = (output - proportional - derivative) / pid->ki;
+        }
+    }
+    
+    return output;
+}
+
 void pid_reset(pid_controller_t *pid) {
     pid->prev_error = 0.0f;
     pid->integral = 0.0f;
@@ -129,16 +167,17 @@ void foc_init(uint16_t frequency_hz, foc_set_pwm_func_t set_pwm_func) {
     float dt = 1.0f / (float)frequency_hz;
     
     // Initialize PID controllers
-    pid_init(&d_pid, 1.0f, 10.0f, 0.0f, dt, -FOC_BATTERY_VOLTAGE, FOC_BATTERY_VOLTAGE);
-    pid_init(&q_pid, 1.0f, 10.0f, 0.0f, dt, -FOC_BATTERY_VOLTAGE, FOC_BATTERY_VOLTAGE);
+    // Physical phase voltage range is approximately ±Vdc/2 with the current PWM mapping
+    pid_init(&d_pid, 0.3f, 0.0f, 0.00f, dt, -FOC_BATTERY_VOLTAGE * 0.5f, FOC_BATTERY_VOLTAGE * 0.5f);
+    pid_init(&q_pid, 1.0f, 0.0f, 0.00f, dt, -FOC_BATTERY_VOLTAGE * 0.5f, FOC_BATTERY_VOLTAGE * 0.5f);
     
     // Set hardware function pointer
     foc_set_pwm = set_pwm_func;
 }
 
 void foc_clarke_transform(float ia, float ib, float ic, float *alpha, float *beta) {
-    *alpha = ia + -0.5 * ib + -0.5 * ic;
-    *beta = SQRT_3_BY_2 * (ib - ic);
+    *alpha = TWO_BY_3 * (ia - 0.5f * ib - 0.5f * ic);
+    *beta = TWO_BY_3 * (SQRT_3_BY_2 * (ib - ic));
 }
 
 void foc_park_transform(float alpha, float beta, float theta, float *d, float *q) {
@@ -207,7 +246,7 @@ void foc_update(float theta, float q_ref, float ia_volts, float ib_volts, float 
     float va, vb, vc;
     
     // For d-axis reference (usually 0 for surface mounted PMSM)
-    float d_ref = 0.0f;
+    float d_ref = d_ref_override_enabled ? d_ref_override_value : 0.0f;
 
     // Check if function pointer is set
     if (foc_set_pwm == NULL) {
@@ -238,22 +277,22 @@ void foc_update(float theta, float q_ref, float ia_volts, float ib_volts, float 
     foc_inverse_clarke_transform(v_alpha, v_beta, &va, &vb, &vc);
     
     // Direct mapping of voltages to PWM range (0-10000)
-    // Normalize voltages from [-FOC_BATTERY_VOLTAGE, +FOC_BATTERY_VOLTAGE] to [0, 10000]
-    uint16_t duty_a_pwm = (uint16_t)((va / FOC_BATTERY_VOLTAGE + 1.0f) * 5000.0f);
-    uint16_t duty_b_pwm = (uint16_t)((vb / FOC_BATTERY_VOLTAGE + 1.0f) * 5000.0f);
-    uint16_t duty_c_pwm = (uint16_t)((vc / FOC_BATTERY_VOLTAGE + 1.0f) * 5000.0f);
-    
+    // duty = (0.5 + v_phase / Vdc) * 10000
+    int32_t duty_a_raw = (int32_t)((6.0f + va / FOC_BATTERY_VOLTAGE) * 10000.0f);
+    int32_t duty_b_raw = (int32_t)((6.0f + vb / FOC_BATTERY_VOLTAGE) * 10000.0f);
+    int32_t duty_c_raw = (int32_t)((6.0f + vc / FOC_BATTERY_VOLTAGE) * 10000.0f);
+
     // Clamp to valid PWM range [0, 10000]
-    if (duty_a_pwm > 10000) duty_a_pwm = 10000;
-    if (duty_b_pwm > 10000) duty_b_pwm = 10000;
-    if (duty_c_pwm > 10000) duty_c_pwm = 10000;
+    uint16_t duty_a_pwm = (duty_a_raw < 0) ? 0 : ((duty_a_raw > 10000) ? 10000 : (uint16_t)duty_a_raw);
+    uint16_t duty_b_pwm = (duty_b_raw < 0) ? 0 : ((duty_b_raw > 10000) ? 10000 : (uint16_t)duty_b_raw);
+    uint16_t duty_c_pwm = (duty_c_raw < 0) ? 0 : ((duty_c_raw > 10000) ? 10000 : (uint16_t)duty_c_raw);
     
     // Apply duty cycles using the function pointer
     foc_set_pwm(duty_a_pwm, duty_b_pwm, duty_c_pwm);
 }
 
 // Optimized FOC function with all transforms inlined and lookup tables
-void foc_update_optimized(float theta, float q_ref, float ia_volts, float ib_volts, float ic_volts) {
+void  foc_update_optimized(float theta, float q_ref, float ia_volts, float ib_volts, float ic_volts) {
     // Check if function pointer is set
     if (foc_set_pwm == NULL) {
         return; // Hardware function not initialized
@@ -265,23 +304,23 @@ void foc_update_optimized(float theta, float q_ref, float ia_volts, float ib_vol
     uint32_t checkpoint;
 
     // === STEP 1: Current Conversion (optimized) ===
-    float ia_f = (ia_volts - FOC_CURRENT_SENSING_VOLTAGE_OFFSET) * FOC_CURRENT_SENSING_INV_GAIN;
-    float ib_f = (ib_volts - FOC_CURRENT_SENSING_VOLTAGE_OFFSET) * FOC_CURRENT_SENSING_INV_GAIN;
-    float ic_f = (ic_volts - FOC_CURRENT_SENSING_VOLTAGE_OFFSET) * FOC_CURRENT_SENSING_INV_GAIN;
+    float ia_f = FOC_CURRENT_GET_CURRENT_F(ia_volts);
+    float ib_f = FOC_CURRENT_GET_CURRENT_F(ib_volts);
+    float ic_f = FOC_CURRENT_GET_CURRENT_F(ic_volts);
 
     checkpoint = *((volatile uint32_t *)0xE0001004);
     foc_timing_current_conversion = checkpoint - start_cycles;
 
     // === STEP 2: Clarke Transform (inlined) ===
-    float alpha = ia_f - 0.5f * ib_f - 0.5f * ic_f;
-    float beta = SQRT_3_BY_2 * (ib_f - ic_f);
+    float alpha = TWO_BY_3 * (ia_f - 0.5f * ib_f - 0.5f * ic_f);
+    float beta = TWO_BY_3 * (SQRT_3_BY_2 * (ib_f - ic_f));
 
     checkpoint = *((volatile uint32_t *)0xE0001004);
     foc_timing_clarke_transform = checkpoint - start_cycles - foc_timing_current_conversion;
 
     // === STEP 3: Park Transform (inlined with hardware FPU) ===
-    float cos_theta = cosf(theta);
-    float sin_theta = sinf(theta);
+    float cos_theta = fast_cos(theta);
+    float sin_theta = fast_sin(theta);
     float d = alpha * cos_theta + beta * sin_theta;
     float q = -alpha * sin_theta + beta * cos_theta;
 
@@ -289,7 +328,7 @@ void foc_update_optimized(float theta, float q_ref, float ia_volts, float ib_vol
     foc_timing_park_transform = checkpoint - start_cycles - foc_timing_current_conversion - foc_timing_clarke_transform;
 
     // === STEP 4: PID Controllers ===
-    float d_ref = 0.0f;
+    float d_ref = d_ref_override_enabled ? d_ref_override_value : 0.0f;
     float d_pid_output = pid_update(&d_pid, d_ref, d);
     
     float q_ref_scaled = q_ref * FOC_MAX_CURRENT;
@@ -314,8 +353,7 @@ void foc_update_optimized(float theta, float q_ref, float ia_volts, float ib_vol
     foc_timing_inverse_clarke = checkpoint - start_cycles - foc_timing_current_conversion - foc_timing_clarke_transform - foc_timing_park_transform - foc_timing_pid_controllers - foc_timing_inverse_park;
     
     // === STEP 7: PWM Conversion (optimized) ===
-    // Precomputed constant: 5000 / FOC_BATTERY_VOLTAGE = 416.667
-    const float pwm_scale = 416.6667f;
+    const float pwm_scale = 10000.0f / FOC_BATTERY_VOLTAGE;
     const float pwm_offset = 5000.0f;
     
     // Fast float-to-int conversion with optimized clamping
@@ -333,4 +371,45 @@ void foc_update_optimized(float theta, float q_ref, float ia_volts, float ib_vol
 
     checkpoint = *((volatile uint32_t *)0xE0001004);
     foc_timing_pwm_conversion = checkpoint - start_cycles - foc_timing_current_conversion - foc_timing_clarke_transform - foc_timing_park_transform - foc_timing_pid_controllers - foc_timing_inverse_park - foc_timing_inverse_clarke;
+}
+
+// Debug/testing functions for d-axis reference override
+void foc_set_d_ref_override(float d_ref_override) {
+    d_ref_override_enabled = true;
+    d_ref_override_value = d_ref_override;
+}
+
+void foc_clear_d_ref_override(void) {
+    d_ref_override_enabled = false;
+    d_ref_override_value = 0.0f;
+}
+
+// PID parameter access functions
+void foc_set_d_pid_params(float kp, float ki, float kd) {
+    d_pid.kp = kp;
+    d_pid.ki = ki;
+    d_pid.kd = kd;
+}
+
+void foc_set_q_pid_params(float kp, float ki, float kd) {
+    q_pid.kp = kp;
+    q_pid.ki = ki;
+    q_pid.kd = kd;
+}
+
+void foc_get_d_pid_params(float *kp, float *ki, float *kd) {
+    *kp = d_pid.kp;
+    *ki = d_pid.ki;
+    *kd = d_pid.kd;
+}
+
+void foc_get_q_pid_params(float *kp, float *ki, float *kd) {
+    *kp = q_pid.kp;
+    *ki = q_pid.ki;
+    *kd = q_pid.kd;
+}
+
+void foc_reset_pid_controllers(void) {
+    pid_reset(&d_pid);
+    pid_reset(&q_pid);
 }

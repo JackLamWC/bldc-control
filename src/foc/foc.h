@@ -1,10 +1,10 @@
 #ifndef FOC_H
 #define FOC_H
 
-#define FOC_MAX_CURRENT 20.0f
+#define FOC_MAX_CURRENT 27.0f
 #define FOC_BATTERY_VOLTAGE 12.0f
 
-#define FOC_CURRENT_SENSING_VOLTAGE_OFFSET 0.5f
+#define FOC_CURRENT_SENSING_VOLTAGE_OFFSET 1.65f
 #define FOC_CURRENT_SENSING_VOLTAGE_MAX 3.3f
 #define FOC_CURRENT_SENSING_R_SENSE 0.005f
 #define FOC_CURRENT_SENSING_GAIN 12.22f
@@ -32,6 +32,7 @@ typedef struct {
 // PID function declarations
 void pid_init(pid_controller_t *pid, float kp, float ki, float kd, float dt, float output_min, float output_max);
 float pid_update(pid_controller_t *pid, float setpoint, float process_variable);
+float pid_update_with_error(pid_controller_t *pid, float error);  // For angular control with pre-calculated error
 void pid_reset(pid_controller_t *pid);
 
 // FOC function declarations
@@ -44,6 +45,17 @@ void foc_inverse_park_transform(float d, float q, float theta, float *v_alpha, f
 void foc_inverse_clarke_transform(float alpha, float beta, float *va, float *vb, float *vc);
 void foc_update(float theta, float q_ref, float ia_volts, float ib_volts, float ic_volts);
 void foc_update_optimized(float theta, float q_ref, float ia_volts, float ib_volts, float ic_volts);
+
+// Debug/testing functions
+void foc_set_d_ref_override(float d_ref_override);
+void foc_clear_d_ref_override(void);
+
+// PID parameter access functions
+void foc_set_d_pid_params(float kp, float ki, float kd);
+void foc_set_q_pid_params(float kp, float ki, float kd);
+void foc_get_d_pid_params(float *kp, float *ki, float *kd);
+void foc_get_q_pid_params(float *kp, float *ki, float *kd);
+void foc_reset_pid_controllers(void);
 
 // Timing profiling variables (extern - defined in main.c)
 extern uint32_t foc_timing_current_conversion;
